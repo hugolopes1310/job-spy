@@ -2,25 +2,32 @@ name: Job Tracker Scan
 
 on:
   schedule:
-    # ~15 runs/jour — toutes les 1h de 7h à 23h heure française (UTC+2)
-    - cron: '0 5 * * *'    # 07h
-    - cron: '0 6 * * *'    # 08h
-    - cron: '0 7 * * *'    # 09h
-    - cron: '0 8 * * *'    # 10h
-    - cron: '0 9 * * *'    # 11h
-    - cron: '0 10 * * *'   # 12h
-    - cron: '0 11 * * *'   # 13h
-    - cron: '0 12 * * *'   # 14h
-    - cron: '0 13 * * *'   # 15h
-    - cron: '0 14 * * *'   # 16h
-    - cron: '0 15 * * *'   # 17h
-    - cron: '0 16 * * *'   # 18h
-    - cron: '0 17 * * *'   # 19h
-    - cron: '0 18 * * *'   # 20h
-    - cron: '0 19 * * *'   # 21h
-    - cron: '0 20 * * *'   # 22h
-    - cron: '0 21 * * *'   # 23h
-  workflow_dispatch: {}     # permet de lancer manuellement
+    - cron: '0 5 * * *'
+    - cron: '0 6 * * *'
+    - cron: '0 7 * * *'
+    - cron: '0 8 * * *'
+    - cron: '0 9 * * *'
+    - cron: '0 10 * * *'
+    - cron: '0 11 * * *'
+    - cron: '0 12 * * *'
+    - cron: '0 13 * * *'
+    - cron: '0 14 * * *'
+    - cron: '0 15 * * *'
+    - cron: '0 16 * * *'
+    - cron: '0 17 * * *'
+    - cron: '0 18 * * *'
+    - cron: '0 19 * * *'
+    - cron: '0 20 * * *'
+    - cron: '0 21 * * *'
+  workflow_dispatch: {}
+
+# Prevent concurrent runs from corrupting the DB
+concurrency:
+  group: job-tracker
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
   scrape:
@@ -40,3 +47,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python tracker.py --once
+
+      - name: Commit updated DB
+        run: |
+          git config user.name "Job Tracker Bot"
+          git config user.email "bot@noreply.github.com"
+          git add jobs.db || true
+          git diff --cached --quiet || git commit -m "Update jobs.db [skip ci]"
+          git push

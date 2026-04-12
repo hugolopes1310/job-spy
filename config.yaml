@@ -1,21 +1,14 @@
 # =====================================================================
 # Job Tracker config — Hugo Lopes
 # =====================================================================
-# Edit this file to change targets, keywords, or scoring.
-# No code change needed.
-# =====================================================================
 
 telegram:
-  # Set these via env vars TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
-  # or fill them here (not recommended for secrets)
   bot_token_env: TELEGRAM_BOT_TOKEN
   chat_id_env: TELEGRAM_CHAT_ID
 
 scoring:
-  # Only notify if total_score >= this threshold
   notify_threshold: 5
 
-  # Keywords that boost the score (+points each)
   title_boost:
     structurer: 6
     structureur: 6
@@ -32,6 +25,8 @@ scoring:
     "private debt": 3
     "quant": 4
     "quantitative": 4
+    "derivatives": 3
+    "sales": 2
 
   description_boost:
     autocall: 3
@@ -48,8 +43,15 @@ scoring:
     "sell-side": 1
     volatility: 1
     rates: 1
+    leonteq: 2
+    vontobel: 2
+    pictet: 2
+    "lombard odier": 2
+    ubp: 2
+    "julius baer": 2
+    siparex: 2
+    pandat: 2
 
-  # Keywords that kill the score (–points each)
   blacklist:
     intern: -10
     stage: -10
@@ -64,7 +66,6 @@ scoring:
     compliance: -4
     "back office": -5
 
-  # Location bonuses
   location_boost:
     geneva: 4
     genève: 4
@@ -77,19 +78,23 @@ scoring:
     "auvergne-rhône-alpes": 3
 
 # =====================================================================
-# Search axes — one entry per LinkedIn query
+# Search axes — multi-source (linkedin, indeed, google)
+# =====================================================================
+# "sites" accepts a list: [linkedin, indeed, google, glassdoor, zip_recruiter]
+# Google Jobs indexes company career pages (Leonteq, Pictet, etc.)
 # =====================================================================
 axes:
-  - name: "A1 — Genève structurés"
-    site: linkedin
+  # --- AXE A : Genève / Suisse — Structurés & Cross Asset ---
+  - name: "A1 — Genève structured products"
+    sites: [linkedin, indeed, google]
     search_term: "structured products"
     location: "Geneva, Switzerland"
     distance: 50
     results_wanted: 30
     hours_old: 24
 
-  - name: "A2 — Genève derivatives"
-    site: linkedin
+  - name: "A2 — Genève equity derivatives"
+    sites: [linkedin, indeed, google]
     search_term: "equity derivatives"
     location: "Geneva, Switzerland"
     distance: 50
@@ -97,41 +102,136 @@ axes:
     hours_old: 24
 
   - name: "A3 — Genève cross asset"
-    site: linkedin
+    sites: [linkedin, indeed, google]
     search_term: "cross asset"
     location: "Geneva, Switzerland"
     distance: 50
     results_wanted: 20
     hours_old: 24
 
-  - name: "A4 — Zurich structurés"
-    site: linkedin
+  - name: "A4 — Genève investment solutions"
+    sites: [linkedin, indeed, google]
+    search_term: "investment solutions"
+    location: "Geneva, Switzerland"
+    distance: 50
+    results_wanted: 20
+    hours_old: 24
+
+  - name: "A5 — Zurich structured products"
+    sites: [linkedin, indeed, google]
     search_term: "structured products"
     location: "Zurich, Switzerland"
     distance: 50
     results_wanted: 20
     hours_old: 24
 
+  - name: "A6 — Zurich derivatives"
+    sites: [linkedin, indeed, google]
+    search_term: "derivatives"
+    location: "Zurich, Switzerland"
+    distance: 50
+    results_wanted: 20
+    hours_old: 24
+
+  # --- Recherches ciblées brokers/banques suisses ---
+  - name: "A7 — Leonteq"
+    sites: [linkedin, google]
+    search_term: "Leonteq"
+    location: "Switzerland"
+    distance: 100
+    results_wanted: 15
+    hours_old: 24
+
+  - name: "A8 — Vontobel"
+    sites: [linkedin, google]
+    search_term: "Vontobel"
+    location: "Switzerland"
+    distance: 100
+    results_wanted: 15
+    hours_old: 24
+
+  - name: "A9 — Julius Baer derivatives"
+    sites: [linkedin, google]
+    search_term: "Julius Baer"
+    location: "Switzerland"
+    distance: 100
+    results_wanted: 15
+    hours_old: 24
+
+  - name: "A10 — Pictet"
+    sites: [linkedin, google]
+    search_term: "Pictet"
+    location: "Geneva, Switzerland"
+    distance: 50
+    results_wanted: 15
+    hours_old: 24
+
+  - name: "A11 — Lombard Odier"
+    sites: [linkedin, google]
+    search_term: "Lombard Odier"
+    location: "Geneva, Switzerland"
+    distance: 50
+    results_wanted: 15
+    hours_old: 24
+
+  - name: "A12 — UBP"
+    sites: [linkedin, google]
+    search_term: "Union Bancaire Privée"
+    location: "Geneva, Switzerland"
+    distance: 50
+    results_wanted: 15
+    hours_old: 24
+
+  - name: "A13 — EFG International"
+    sites: [linkedin, google]
+    search_term: "EFG International"
+    location: "Switzerland"
+    distance: 100
+    results_wanted: 10
+    hours_old: 24
+
+  # --- AXE B : Lyon — AM / PE ---
   - name: "B1 — Lyon asset management"
-    site: linkedin
+    sites: [linkedin, indeed, google]
     search_term: "asset management"
     location: "Lyon, France"
     distance: 50
     results_wanted: 30
     hours_old: 24
+    country_indeed: france
 
   - name: "B2 — Lyon private equity"
-    site: linkedin
+    sites: [linkedin, indeed, google]
     search_term: "private equity"
     location: "Lyon, France"
     distance: 50
     results_wanted: 25
     hours_old: 24
+    country_indeed: france
 
+  - name: "B3 — Lyon gestion"
+    sites: [linkedin, indeed, google]
+    search_term: "gestion de portefeuille"
+    location: "Lyon, France"
+    distance: 50
+    results_wanted: 20
+    hours_old: 24
+    country_indeed: france
+
+  - name: "B4 — Siparex"
+    sites: [linkedin, google]
+    search_term: "Siparex"
+    location: "Lyon, France"
+    distance: 50
+    results_wanted: 10
+    hours_old: 24
+
+  # --- AXE C : Fintech Lyon ---
   - name: "C — Fintech Lyon"
-    site: linkedin
+    sites: [linkedin, indeed, google]
     search_term: "fintech"
     location: "Lyon, France"
     distance: 50
     results_wanted: 25
     hours_old: 24
+    country_indeed: france

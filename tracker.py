@@ -1,4 +1,4 @@
-"""Job tracker main loop.
+"""Job tracker main loop — multi-source with cross-source dedup.
 
 Usage:
     python tracker.py --once          # one pass of all axes, notify new offers
@@ -20,9 +20,11 @@ from db import (
     DB_PATH,
     connect,
     fetch_new_above,
+    fingerprint_exists,
     init_db,
     insert_job,
     job_exists,
+    make_fingerprint,
     mark_notified,
     stats,
 )
@@ -55,18 +57,25 @@ def run_scrape(cfg: dict) -> int:
     with connect(DB_PATH) as conn:
         for axe in cfg["axes"]:
             name = axe["name"]
-            print(f"[tracker] Scraping axe: {name}")
+            sites = axe.get("sites", [axe.get("site", "linkedin")])
+            if isinstance(sites, str):
+                sites = [sites]
+
+            print(f"[tracker] Scraping axe: {name} (sites: {', '.join(sites)})")
             try:
-                df = scrape_jobs(
-                    site_name=[axe.get("site", "linkedin")],
+                kwargs = dict(
+                    site_name=sites,
                     search_term=axe["search_term"],
                     location=axe.get("location"),
-                    distance=axe.get("distance", 50),
                     results_wanted=axe.get("results_wanted", 25),
-                    hours_old=axe.get("hours_old", 48),
-                    country_indeed="france",
+                    hours_old=axe.get("hours_old", 24),
                     linkedin_fetch_description=True,
                 )
+                if axe.get("distance"):
+                    kwargs["distance"] = axe["distance"]
+                if "indeed" in sites:
+                    kwargs["country_indeed"] = axe.get("country_indeed", "france")
+                df = scrape_jobs(**kwargs)
             except Exception as e:  # noqa: BLE001
                 print(f"[tracker] Error scraping {name}: {e}")
                 continue
@@ -75,11 +84,14 @@ def run_scrape(cfg: dict) -> int:
                 print(f"[tracker]   0 results")
                 continue
 
+            axis_new = 0
             for _, row in df.iterrows():
                 url = row.get("job_url") or row.get("url")
                 if not url:
                     continue
                 jid = job_id_for(url)
+
+                # Dedup 1: exact URL match
                 if job_exists(conn, jid):
                     continue
 
@@ -88,9 +100,16 @@ def run_scrape(cfg: dict) -> int:
                 location = (row.get("location") or "").strip()
                 description = (row.get("description") or "") or ""
                 date_posted = str(row.get("date_posted") or "")
+                site_name = str(row.get("site") or sites[0])
+
+                # Dedup 2: same title+company across different sources
+                fp = make_fingerprint(title, company)
+                if fingerprint_exists(conn, fp):
+                    continue
 
                 job = {
                     "id": jid,
+                    "fingerprint": fp,
                     "axe": name,
                     "title": title,
                     "company": company,
@@ -98,7 +117,7 @@ def run_scrape(cfg: dict) -> int:
                     "url": url,
                     "description": description,
                     "date_posted": date_posted,
-                    "site": axe.get("site", "linkedin"),
+                    "site": site_name,
                     "first_seen": datetime.utcnow().isoformat(),
                 }
                 s, reasons = score_job(job, cfg.get("scoring", {}))
@@ -106,8 +125,9 @@ def run_scrape(cfg: dict) -> int:
                 job["score_reasons"] = reasons
 
                 insert_job(conn, job)
+                axis_new += 1
                 new_count += 1
-            print(f"[tracker]   ingested {len(df)} rows from {name}")
+            print(f"[tracker]   {len(df)} scraped, {axis_new} new from {name}")
     print(f"[tracker] Done. {new_count} new offers inserted.")
     return new_count
 
