@@ -21,6 +21,13 @@ on:
     - cron: '0 21 * * *'
   workflow_dispatch: {}
 
+concurrency:
+  group: job-tracker
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -35,4 +42,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python tracker.py --once
+      - name: Commit updated DB
+        run: |
+          git config user.name "Job Tracker Bot"
+          git config user.email "bot@noreply.github.com"
+          git add jobs.db || true
+          git diff --cached --quiet || git commit -m "Update jobs.db [skip ci]"
+          git push

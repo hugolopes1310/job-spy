@@ -59,12 +59,15 @@ scoring:
   blacklist:
     # Seniority
     intern: -10
+    trainee: -10
+    stagiaire: -10
     stage: -10
     alternance: -10
     apprenti: -10
     "senior director": -6
     "managing director": -6
     "head of": -4
+    directeur: -5
     director: -3
     # Middle/back office
     "middle office": -15
@@ -87,6 +90,7 @@ scoring:
     sre: -6
     frontend: -6
     backend: -6
+    "identity management": -8
     # Fonctions non pertinentes
     coo: -5
     cfo: -5
@@ -96,6 +100,16 @@ scoring:
     audit: -4
     comptable: -6
     accounting: -5
+    fiscal: -8
+    "droit fiscal": -10
+    notaire: -8
+    juridique: -6
+    "gestion de patrimoine": -6
+    "planificateur financier": -8
+    "conseiller financier": -4
+    immobilier: -6
+    assurance: -5
+    courtier: -4
 
   location_boost:
     geneva: 4
