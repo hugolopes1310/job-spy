@@ -133,20 +133,52 @@ def run_scrape(cfg: dict) -> int:
 
 
 def run_notify(cfg: dict) -> int:
-    """Push every new offer above threshold to Telegram."""
+    """Push every new offer above threshold to Telegram, with optional LLM scoring."""
     threshold = int(cfg.get("scoring", {}).get("notify_threshold", 5))
+    llm_threshold = int(cfg.get("scoring", {}).get("llm_min_score", 5))
     tg_cfg = cfg.get("telegram", {})
+
+    # Try to import LLM scorer (optional — works without it)
+    try:
+        from llm_scorer import score_with_llm
+        import os
+        llm_available = bool(os.environ.get("GEMINI_API_KEY"))
+    except ImportError:
+        llm_available = False
+
     sent = 0
+    skipped_by_llm = 0
     with connect(DB_PATH) as conn:
         rows = fetch_new_above(conn, threshold)
-        print(f"[tracker] {len(rows)} offer(s) above threshold {threshold}")
+        print(f"[tracker] {len(rows)} offer(s) above keyword threshold {threshold}")
+        if llm_available:
+            print(f"[tracker] LLM scoring enabled (Gemini Flash) — min AI score: {llm_threshold}")
+
         for row in rows:
-            msg = format_job_message(row)
+            llm_score = -1
+            llm_reason = ""
+
+            # Second pass: LLM fit scoring
+            if llm_available:
+                llm_score, llm_reason = score_with_llm(
+                    title=row["title"] or "",
+                    company=row["company"] or "",
+                    location=row["location"] or "",
+                    description=row["description"] or "",
+                )
+                print(f"[tracker]   AI score {llm_score}/10 for: {row['title']} @ {row['company']}")
+                if llm_score >= 0 and llm_score < llm_threshold:
+                    mark_notified(conn, row["id"])  # mark as processed, don't notify
+                    skipped_by_llm += 1
+                    continue
+
+            msg = format_job_message(row, llm_score=llm_score, llm_reason=llm_reason)
             ok = send_telegram(tg_cfg, msg)
             if ok:
                 mark_notified(conn, row["id"])
                 sent += 1
-    print(f"[tracker] {sent} notification(s) sent.")
+
+    print(f"[tracker] {sent} notification(s) sent, {skipped_by_llm} filtered by AI.")
     return sent
 
 

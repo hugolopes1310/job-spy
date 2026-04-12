@@ -47,16 +47,18 @@ def send_telegram(cfg: dict, text: str, disable_preview: bool = True) -> bool:
         return False
 
 
-def format_job_message(row) -> str:
-    """Format one SQLite row as a Markdown Telegram message."""
+def format_job_message(row, llm_score: int = -1, llm_reason: str = "") -> str:
+    """Format one SQLite row as a Markdown Telegram message.
+
+    If llm_score >= 0, adds the AI fit assessment.
+    """
     title = row["title"] or "?"
     company = row["company"] or "?"
     location = row["location"] or "?"
     axe = row["axe"] or "?"
-    score = row["score"]
+    kw_score = row["score"]
     url = row["url"]
 
-    # Escape Telegram Markdown v1 specials: _ * [ ` and backslash
     def esc(s: str) -> str:
         return (
             str(s)
@@ -67,9 +69,16 @@ def format_job_message(row) -> str:
             .replace("[", "\\[")
         )
 
-    return (
-        f"*[{score}pts]* {esc(title)}\n"
-        f"🏢 {esc(company)}  •  📍 {esc(location)}\n"
-        f"🎯 {esc(axe)}\n"
-        f"🔗 {url}"
-    )
+    lines = [
+        f"*[KW:{kw_score}]*",
+    ]
+    if llm_score >= 0:
+        lines[0] += f" *[AI:{llm_score}/10]*"
+    lines.append(f"{esc(title)}")
+    lines.append(f"🏢 {esc(company)}  •  📍 {esc(location)}")
+    lines.append(f"🎯 {esc(axe)}")
+    if llm_reason:
+        lines.append(f"💡 {esc(llm_reason)}")
+    lines.append(f"🔗 {url}")
+
+    return "\n".join(lines)

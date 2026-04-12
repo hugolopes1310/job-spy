@@ -8,6 +8,7 @@ telegram:
 
 scoring:
   notify_threshold: 7
+  llm_min_score: 5       # AI score minimum (0-10) pour envoyer sur Telegram
 
   title_boost:
     structurer: 6
