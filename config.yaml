@@ -23,10 +23,13 @@ scoring:
     "investment advisor": 3
     "private equity": 3
     "private debt": 3
-    "quant": 4
-    "quantitative": 4
+    "quant": 2
+    "quantitative": 2
     "derivatives": 3
     "sales": 2
+    "structuring": 5
+    "advisory": 3
+    "portfolio": 2
 
   description_boost:
     autocall: 3
@@ -36,8 +39,8 @@ scoring:
     payoff: 2
     termsheet: 2
     rfq: 2
-    python: 1
-    vba: 1
+    python: 0
+    vba: 0
     bloomberg: 1
     "buy-side": 1
     "sell-side": 1
@@ -53,6 +56,7 @@ scoring:
     pandat: 2
 
   blacklist:
+    # Seniority
     intern: -10
     stage: -10
     alternance: -10
@@ -60,11 +64,37 @@ scoring:
     "senior director": -6
     "managing director": -6
     "head of": -4
+    director: -3
+    # Middle/back office
+    "middle office": -15
+    "back office": -10
+    settlement: -8
+    reconciliation: -8
+    "fund accounting": -8
+    "transfer agent": -8
+    nav: -5
+    custodian: -6
+    clearing: -6
+    "trade support": -8
+    operations: -4
+    # Tech pur
+    developer: -6
+    "software engineer": -8
+    devops: -8
+    "data engineer": -8
+    "full stack": -8
+    sre: -6
+    frontend: -6
+    backend: -6
+    # Fonctions non pertinentes
     coo: -5
     cfo: -5
     kyc: -5
     compliance: -4
-    "back office": -5
+    "risk manager": -3
+    audit: -4
+    comptable: -6
+    accounting: -5
 
   location_boost:
     geneva: 4
