@@ -1,0 +1,3 @@
+python-jobspy>=1.1.70
+pyyaml>=6.0
+flask>=3.0

@@ -1,0 +1,5 @@
+jobs.db
+tracker.log
+.venv/
+__pycache__/
+*.pyc

@@ -1,0 +1,137 @@
+# =====================================================================
+# Job Tracker config — Hugo Lopes
+# =====================================================================
+# Edit this file to change targets, keywords, or scoring.
+# No code change needed.
+# =====================================================================
+
+telegram:
+  # Set these via env vars TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+  # or fill them here (not recommended for secrets)
+  bot_token_env: TELEGRAM_BOT_TOKEN
+  chat_id_env: TELEGRAM_CHAT_ID
+
+scoring:
+  # Only notify if total_score >= this threshold
+  notify_threshold: 5
+
+  # Keywords that boost the score (+points each)
+  title_boost:
+    structurer: 6
+    structureur: 6
+    "structured products": 6
+    "produits structurés": 6
+    "cross asset": 5
+    "multi asset": 4
+    "investment solutions": 5
+    "equity derivatives": 5
+    "fixed income": 3
+    "financial engineering": 4
+    "investment advisor": 3
+    "private equity": 3
+    "private debt": 3
+    "quant": 4
+    "quantitative": 4
+
+  description_boost:
+    autocall: 3
+    phoenix: 2
+    cln: 2
+    "reverse convertible": 2
+    payoff: 2
+    termsheet: 2
+    rfq: 2
+    python: 1
+    vba: 1
+    bloomberg: 1
+    "buy-side": 1
+    "sell-side": 1
+    volatility: 1
+    rates: 1
+
+  # Keywords that kill the score (–points each)
+  blacklist:
+    intern: -10
+    stage: -10
+    alternance: -10
+    apprenti: -10
+    "senior director": -6
+    "managing director": -6
+    "head of": -4
+    coo: -5
+    cfo: -5
+    kyc: -5
+    compliance: -4
+    "back office": -5
+
+  # Location bonuses
+  location_boost:
+    geneva: 4
+    genève: 4
+    zurich: 3
+    zürich: 3
+    lausanne: 3
+    switzerland: 3
+    suisse: 3
+    lyon: 4
+    "auvergne-rhône-alpes": 3
+
+# =====================================================================
+# Search axes — one entry per LinkedIn query
+# =====================================================================
+axes:
+  - name: "A1 — Genève structurés"
+    site: linkedin
+    search_term: "structured products"
+    location: "Geneva, Switzerland"
+    distance: 50
+    results_wanted: 30
+    hours_old: 24
+
+  - name: "A2 — Genève derivatives"
+    site: linkedin
+    search_term: "equity derivatives"
+    location: "Geneva, Switzerland"
+    distance: 50
+    results_wanted: 20
+    hours_old: 24
+
+  - name: "A3 — Genève cross asset"
+    site: linkedin
+    search_term: "cross asset"
+    location: "Geneva, Switzerland"
+    distance: 50
+    results_wanted: 20
+    hours_old: 24
+
+  - name: "A4 — Zurich structurés"
+    site: linkedin
+    search_term: "structured products"
+    location: "Zurich, Switzerland"
+    distance: 50
+    results_wanted: 20
+    hours_old: 24
+
+  - name: "B1 — Lyon asset management"
+    site: linkedin
+    search_term: "asset management"
+    location: "Lyon, France"
+    distance: 50
+    results_wanted: 30
+    hours_old: 24
+
+  - name: "B2 — Lyon private equity"
+    site: linkedin
+    search_term: "private equity"
+    location: "Lyon, France"
+    distance: 50
+    results_wanted: 25
+    hours_old: 24
+
+  - name: "C — Fintech Lyon"
+    site: linkedin
+    search_term: "fintech"
+    location: "Lyon, France"
+    distance: 50
+    results_wanted: 25
+    hours_old: 24
