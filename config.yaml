@@ -7,7 +7,7 @@ telegram:
   chat_id_env: TELEGRAM_CHAT_ID
 
 scoring:
-  notify_threshold: 5
+  notify_threshold: 7
 
   title_boost:
     structurer: 6
