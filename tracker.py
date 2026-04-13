@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -177,6 +178,10 @@ def run_notify(cfg: dict) -> int:
             if ok:
                 mark_notified(conn, row["id"])
                 sent += 1
+
+            # Respect Gemini free tier (15 RPM) — stay well under limit
+            if llm_available:
+                time.sleep(5)
 
     print(f"[tracker] {sent} notification(s) sent, {skipped_by_llm} filtered by AI.")
     return sent

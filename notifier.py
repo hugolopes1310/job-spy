@@ -77,7 +77,7 @@ def format_job_message(row, llm_score: int = -1, llm_reason: str = "") -> str:
     lines.append(f"{esc(title)}")
     lines.append(f"🏢 {esc(company)}  •  📍 {esc(location)}")
     lines.append(f"🎯 {esc(axe)}")
-    if llm_reason:
+    if llm_reason and not llm_reason.startswith("LLM error"):
         lines.append(f"💡 {esc(llm_reason)}")
     lines.append(f"🔗 {url}")
 

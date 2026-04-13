@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -75,20 +77,30 @@ def score_with_llm(title: str, company: str, location: str, description: str) ->
 
     url = f"{GEMINI_URL}?key={api_key}"
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-    )
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read().decode())
-        text = body["candidates"][0]["content"]["parts"][0]["text"]
-        # Extract JSON from response (handle markdown fences)
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]  # remove ```json line
-            text = text.rsplit("```", 1)[0]  # remove closing ```
-        result = json.loads(text.strip())
-        return int(result["score"]), result.get("reason", "")
-    except Exception as e:  # noqa: BLE001
-        return -1, f"LLM error: {e}"
+    # Retry with exponential backoff on rate limit (429) / transient errors
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        try:
+            req = urllib.request.Request(
+                url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.loads(resp.read().decode())
+            text = body["candidates"][0]["content"]["parts"][0]["text"]
+            text = text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+                text = text.rsplit("```", 1)[0]
+            result = json.loads(text.strip())
+            return int(result["score"]), result.get("reason", "")
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < max_attempts - 1:
+                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s
+                print(f"[llm] 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
+                time.sleep(wait)
+                continue
+            return -1, f"LLM error: HTTP {e.code}"
+        except Exception as e:  # noqa: BLE001
+            return -1, f"LLM error: {e}"
+    return -1, "LLM error: rate limit"

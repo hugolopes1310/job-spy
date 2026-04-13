@@ -91,6 +91,11 @@ scoring:
     frontend: -6
     backend: -6
     "identity management": -8
+    "machine learning": -10
+    "machine learning engineer": -12
+    "data scientist": -8
+    "business analyst": -6
+    "business intelligence": -6
     # Fonctions non pertinentes
     coo: -5
     cfo: -5
