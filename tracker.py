@@ -153,7 +153,7 @@ def run_notify(cfg: dict) -> int:
         rows = fetch_new_above(conn, threshold)
         print(f"[tracker] {len(rows)} offer(s) above keyword threshold {threshold}")
         if llm_available:
-            print(f"[tracker] LLM scoring enabled (Gemini Flash) — min AI score: {llm_threshold}")
+            print(f"[tracker] LLM scoring enabled (Groq Llama 3.3 70B) — min AI score: {llm_threshold}")
 
         for row in rows:
             llm_score = -1
