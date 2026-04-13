@@ -134,14 +134,24 @@ def fetch_notified_last_week(conn):
 def save_feedback(conn, job_id: str, action: str) -> None:
     """Record a user feedback action on a job (good/bad/applied).
 
-    Idempotent: avoid duplicates for the same (job_id, action).
+    Exclusive: a new vote on the same job replaces any previous feedback row
+    for that job (so changing your mind from 'good' to 'bad' doesn't send
+    contradictory signals to the LLM few-shot prompt).
+
+    Special case: an 'applied' vote is additive to an existing 'good' (you
+    liked it, then applied) — applied stacks on good but replaces bad.
     """
-    existing = conn.execute(
-        "SELECT 1 FROM feedback WHERE job_id = ? AND action = ?",
-        (job_id, action),
-    ).fetchone()
-    if existing:
-        return
+    if action == "applied":
+        # Clear any 'bad' — keep existing 'good' if any, add 'applied'
+        conn.execute("DELETE FROM feedback WHERE job_id = ? AND action = 'bad'", (job_id,))
+        existing = conn.execute(
+            "SELECT 1 FROM feedback WHERE job_id = ? AND action = 'applied'", (job_id,)
+        ).fetchone()
+        if existing:
+            return
+    else:
+        # good / bad → wipe everything for that job, then insert fresh
+        conn.execute("DELETE FROM feedback WHERE job_id = ?", (job_id,))
     conn.execute(
         "INSERT INTO feedback (job_id, action, created_at) VALUES (?, ?, ?)",
         (job_id, action, datetime.utcnow().isoformat()),
