@@ -31,6 +31,7 @@ from db import (
     fetch_new_above,
     fetch_recent_titles_for_company,
     fingerprint_exists,
+    fingerprint_status,
     get_company,
     init_db,
     insert_job,
@@ -56,109 +57,214 @@ def job_id_for(url: str) -> str:
     return hashlib.sha1(url.encode("utf-8")).hexdigest()
 
 
-def run_scrape(cfg: dict) -> int:
-    """Scrape all axes and insert new jobs. Returns count of new rows."""
-    try:
-        from jobspy import scrape_jobs  # type: ignore
-    except ImportError:
-        print(
-            "[tracker] jobspy is not installed. Run: pip install python-jobspy pyyaml"
-        )
-        sys.exit(1)
+REPOST_GAP_DAYS_DEFAULT = 45
 
+
+def _ingest_row(
+    conn,
+    axe_name: str,
+    raw: dict,
+    cfg: dict,
+    sem_enabled: bool,
+    sem_check=None,
+    repost_gap_days: int = REPOST_GAP_DAYS_DEFAULT,
+) -> int:
+    """Insert one scraped row through the dedup pipeline. Returns 1 if inserted, 0 otherwise.
+
+    Handles:
+      - URL-level dedup (exact)
+      - Fingerprint dedup with repost detection (old fingerprint = repost, flagged
+        but re-inserted; recent fingerprint = blocked)
+      - Semantic dedup on same-company titles (optional)
+      - Keyword scoring
+    """
+    url = raw.get("job_url") or raw.get("url")
+    if not url:
+        return 0
+    jid = job_id_for(url)
+    if job_exists(conn, jid):
+        return 0
+
+    title = (raw.get("title") or "").strip()
+    company = (raw.get("company") or "").strip()
+    location = (raw.get("location") or "").strip()
+    description = raw.get("description") or ""
+    date_posted = str(raw.get("date_posted") or "")
+    site_name = str(raw.get("site") or "unknown")
+
+    fp = make_fingerprint(title, company)
+    is_repost = False
+    repost_of = None
+    gap_days = None
+    fp_status = fingerprint_status(conn, fp)
+    if fp_status is not None:
+        oldest_id, oldest_first_seen, _cnt = fp_status
+        try:
+            first_dt = datetime.fromisoformat(oldest_first_seen)
+            gap_days = (datetime.utcnow() - first_dt).days
+        except (ValueError, TypeError):
+            gap_days = None
+        if gap_days is not None and gap_days >= repost_gap_days:
+            # Repost detected — insert but flag it
+            is_repost = True
+            repost_of = oldest_id
+            print(f"[tracker]   ♻️  repost detected ({gap_days}d gap): {title} @ {company}")
+        else:
+            # Recent duplicate — block
+            return 0
+
+    # Semantic dedup on same-company titles
+    if sem_enabled and sem_check and company:
+        existing = [r["title"] for r in fetch_recent_titles_for_company(conn, company)]
+        if existing and sem_check(title, existing):
+            print(f"[tracker]   semantic dup skipped: {title} @ {company}")
+            return 0
+
+    job = {
+        "id": jid,
+        "fingerprint": fp,
+        "axe": axe_name,
+        "title": title,
+        "company": company,
+        "location": location,
+        "url": url,
+        "description": description,
+        "date_posted": date_posted,
+        "site": site_name,
+        "is_repost": is_repost,
+        "repost_of": repost_of,
+        "repost_gap_days": gap_days if is_repost else None,
+        "first_seen": datetime.utcnow().isoformat(),
+    }
+    s, reasons = score_job(job, cfg.get("scoring", {}))
+    job["score"] = s
+    job["score_reasons"] = reasons
+    insert_job(conn, job)
+    return 1
+
+
+def run_scrape(cfg: dict) -> int:
+    """Scrape all sources and insert new jobs. Returns count of new rows."""
     # Optional semantic dedup (requires Groq)
     sem_cfg = cfg.get("semantic_dedup", {}) or {}
     sem_enabled = bool(sem_cfg.get("enabled", False)) and bool(
         _os_env("GROQ_API_KEY") or _os_env("GEMINI_API_KEY")
     )
+    sem_check = None
     if sem_enabled:
         try:
-            from semantic_dedup import is_semantic_duplicate
+            from semantic_dedup import is_semantic_duplicate as sem_check  # type: ignore
         except ImportError:
             sem_enabled = False
+            sem_check = None
+
+    repost_gap = int(cfg.get("repost", {}).get("gap_days", REPOST_GAP_DAYS_DEFAULT))
 
     new_count = 0
     with connect(DB_PATH) as conn:
-        for axe in cfg["axes"]:
-            name = axe["name"]
-            sites = axe.get("sites", [axe.get("site", "linkedin")])
-            if isinstance(sites, str):
-                sites = [sites]
+        # 1) Core jobspy loop (LinkedIn / Indeed / Google Jobs)
+        try:
+            from jobspy import scrape_jobs  # type: ignore
+        except ImportError:
+            print("[tracker] jobspy not installed — skipping core sources")
+            scrape_jobs = None  # type: ignore
 
-            print(f"[tracker] Scraping axe: {name} (sites: {', '.join(sites)})")
+        if scrape_jobs is not None:
+            for axe in cfg.get("axes", []):
+                name = axe["name"]
+                sites = axe.get("sites", [axe.get("site", "linkedin")])
+                if isinstance(sites, str):
+                    sites = [sites]
+                print(f"[tracker] Scraping axe: {name} (sites: {', '.join(sites)})")
+                try:
+                    kwargs = dict(
+                        site_name=sites,
+                        search_term=axe["search_term"],
+                        location=axe.get("location"),
+                        results_wanted=axe.get("results_wanted", 25),
+                        hours_old=axe.get("hours_old", 24),
+                        linkedin_fetch_description=True,
+                    )
+                    if axe.get("distance"):
+                        kwargs["distance"] = axe["distance"]
+                    if "indeed" in sites:
+                        kwargs["country_indeed"] = axe.get("country_indeed", "france")
+                    df = scrape_jobs(**kwargs)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[tracker] Error scraping {name}: {e}")
+                    continue
+                if df is None or df.empty:
+                    print("[tracker]   0 results")
+                    continue
+                axis_new = 0
+                for _, row in df.iterrows():
+                    raw = {
+                        "title": row.get("title"),
+                        "company": row.get("company"),
+                        "location": row.get("location"),
+                        "description": row.get("description"),
+                        "date_posted": row.get("date_posted"),
+                        "site": row.get("site") or sites[0],
+                        "job_url": row.get("job_url") or row.get("url"),
+                    }
+                    axis_new += _ingest_row(conn, name, raw, cfg, sem_enabled, sem_check, repost_gap)
+                new_count += axis_new
+                print(f"[tracker]   {len(df)} scraped, {axis_new} new from {name}")
+
+        # 2) Extra scrapers (WTTJ / JobUp.ch / eFinancialCareers)
+        extra_cfg = cfg.get("extra_sources", {}) or {}
+        if extra_cfg.get("enabled"):
             try:
-                kwargs = dict(
-                    site_name=sites,
-                    search_term=axe["search_term"],
-                    location=axe.get("location"),
-                    results_wanted=axe.get("results_wanted", 25),
-                    hours_old=axe.get("hours_old", 24),
-                    linkedin_fetch_description=True,
-                )
-                if axe.get("distance"):
-                    kwargs["distance"] = axe["distance"]
-                if "indeed" in sites:
-                    kwargs["country_indeed"] = axe.get("country_indeed", "france")
-                df = scrape_jobs(**kwargs)
-            except Exception as e:  # noqa: BLE001
-                print(f"[tracker] Error scraping {name}: {e}")
-                continue
-
-            if df is None or df.empty:
-                print(f"[tracker]   0 results")
-                continue
-
-            axis_new = 0
-            for _, row in df.iterrows():
-                url = row.get("job_url") or row.get("url")
-                if not url:
+                from extra_scrapers import SCRAPERS as _EXTRA
+            except ImportError as e:
+                print(f"[tracker] extra_scrapers unavailable: {e}")
+                _EXTRA = {}
+            for source, scfg in extra_cfg.items():
+                if source == "enabled" or not isinstance(scfg, dict):
                     continue
-                jid = job_id_for(url)
-
-                # Dedup 1: exact URL match
-                if job_exists(conn, jid):
+                if not scfg.get("enabled"):
                     continue
-
-                title = (row.get("title") or "").strip()
-                company = (row.get("company") or "").strip()
-                location = (row.get("location") or "").strip()
-                description = (row.get("description") or "") or ""
-                date_posted = str(row.get("date_posted") or "")
-                site_name = str(row.get("site") or sites[0])
-
-                # Dedup 2: same title+company across different sources
-                fp = make_fingerprint(title, company)
-                if fingerprint_exists(conn, fp):
+                fn = _EXTRA.get(source)
+                if not fn:
                     continue
-
-                # Dedup 3 (optional): semantic — same company reworded
-                if sem_enabled and company:
-                    existing = [r["title"] for r in fetch_recent_titles_for_company(conn, company)]
-                    if existing and is_semantic_duplicate(title, existing):
-                        print(f"[tracker]   semantic dup skipped: {title} @ {company}")
+                for q in scfg.get("queries", []):
+                    axe_name = q.get("axe") or f"extra_{source}"
+                    try:
+                        rows = fn(q["search"], q.get("location"), q.get("limit", 25))
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[tracker] {source} error: {e}")
                         continue
+                    print(f"[tracker] {source} '{q['search']}' → {len(rows)} hits")
+                    added = 0
+                    for r in rows:
+                        added += _ingest_row(conn, axe_name, r, cfg, sem_enabled, sem_check, repost_gap)
+                    new_count += added
+                    print(f"[tracker]   +{added} new from {source}")
 
-                job = {
-                    "id": jid,
-                    "fingerprint": fp,
-                    "axe": name,
-                    "title": title,
-                    "company": company,
-                    "location": location,
-                    "url": url,
-                    "description": description,
-                    "date_posted": date_posted,
-                    "site": site_name,
-                    "first_seen": datetime.utcnow().isoformat(),
-                }
-                s, reasons = score_job(job, cfg.get("scoring", {}))
-                job["score"] = s
-                job["score_reasons"] = reasons
+        # 3) Company feeds (Greenhouse / Lever / SmartRecruiters)
+        feeds_cfg = cfg.get("company_feeds", {}) or {}
+        if feeds_cfg.get("enabled"):
+            try:
+                from company_feeds import fetch_all
+            except ImportError as e:
+                print(f"[tracker] company_feeds unavailable: {e}")
+                fetch_all = None  # type: ignore
+            if fetch_all is not None:
+                companies = feeds_cfg.get("companies", [])
+                max_age = feeds_cfg.get("max_age_days", 14)
+                try:
+                    results = fetch_all(companies, max_age_days=max_age)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[tracker] company_feeds error: {e}")
+                    results = []
+                for axe_name, jobs in results:
+                    added = 0
+                    for r in jobs:
+                        added += _ingest_row(conn, axe_name, r, cfg, sem_enabled, sem_check, repost_gap)
+                    if added:
+                        new_count += added
+                        print(f"[tracker]   +{added} new from {axe_name} (direct feed)")
 
-                insert_job(conn, job)
-                axis_new += 1
-                new_count += 1
-            print(f"[tracker]   {len(df)} scraped, {axis_new} new from {name}")
     print(f"[tracker] Done. {new_count} new offers inserted.")
     return new_count
 
@@ -223,6 +329,26 @@ def run_notify(cfg: dict) -> int:
                 if analysis:
                     llm_score = int(analysis.get("score", 0))
                     llm_reason = str(analysis.get("reason", ""))
+                    # Repost penalty: -2 on the AI score and add a red flag
+                    try:
+                        is_repost = bool(row["is_repost"])
+                    except (IndexError, KeyError):
+                        is_repost = False
+                    if is_repost and llm_score > 0:
+                        penalty = int(cfg.get("repost", {}).get("score_penalty", 2))
+                        llm_score = max(0, llm_score - penalty)
+                        analysis["score"] = llm_score
+                        gap = 0
+                        try:
+                            gap = int(row["repost_gap_days"] or 0)
+                        except (IndexError, KeyError, TypeError, ValueError):
+                            gap = 0
+                        flag = (
+                            f"♻️ Republiée après {gap}j — signal de turnover / poste non pourvu"
+                        )
+                        rf = analysis.setdefault("red_flags", [])
+                        if isinstance(rf, list):
+                            rf.append(flag)
                     save_llm_analysis(conn, row["id"], _json.dumps(analysis, ensure_ascii=False))
                 else:
                     llm_reason = "LLM error"

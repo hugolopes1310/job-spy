@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     score          INTEGER NOT NULL DEFAULT 0,
     score_reasons  TEXT,
     llm_analysis   TEXT,                        -- JSON blob from structured Groq call
+    is_repost      INTEGER NOT NULL DEFAULT 0, -- 1 if this fingerprint was already seen > N days ago
+    repost_of      TEXT,                        -- id of the original job (oldest with same fingerprint)
+    repost_gap_days INTEGER,                    -- days between original and this repost
     status         TEXT NOT NULL DEFAULT 'new',
     first_seen     TEXT NOT NULL,
     notified_at    TEXT
@@ -47,6 +50,9 @@ CREATE TABLE IF NOT EXISTS companies (
 MIGRATIONS = [
     "ALTER TABLE jobs ADD COLUMN fingerprint TEXT",
     "ALTER TABLE jobs ADD COLUMN llm_analysis TEXT",
+    "ALTER TABLE jobs ADD COLUMN is_repost INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN repost_of TEXT",
+    "ALTER TABLE jobs ADD COLUMN repost_gap_days INTEGER",
 ]
 
 
@@ -139,14 +145,39 @@ def fingerprint_exists(conn, fingerprint: str) -> bool:
     return row is not None
 
 
+def fingerprint_status(conn, fingerprint: str):
+    """Return (oldest_id, oldest_first_seen_iso, count) for a fingerprint, or None if new.
+
+    Used for repost detection: an offer with the same fingerprint resurfacing after
+    a long gap is a repost (likely turnover or unfilled position).
+    """
+    if not fingerprint:
+        return None
+    row = conn.execute(
+        """
+        SELECT id, first_seen, COUNT(*) OVER() AS cnt
+        FROM jobs
+        WHERE fingerprint = ?
+        ORDER BY first_seen ASC
+        LIMIT 1
+        """,
+        (fingerprint,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["id"], row["first_seen"], row["cnt"]
+
+
 def insert_job(conn, job: dict) -> None:
     conn.execute(
         """
         INSERT INTO jobs (id, fingerprint, axe, title, company, location, url,
                           description, date_posted, site, score, score_reasons,
+                          is_repost, repost_of, repost_gap_days,
                           status, first_seen)
         VALUES (:id, :fingerprint, :axe, :title, :company, :location, :url,
                 :description, :date_posted, :site, :score, :score_reasons,
+                :is_repost, :repost_of, :repost_gap_days,
                 :status, :first_seen)
         """,
         {
@@ -162,6 +193,9 @@ def insert_job(conn, job: dict) -> None:
             "site": job.get("site"),
             "score": job.get("score", 0),
             "score_reasons": job.get("score_reasons"),
+            "is_repost": 1 if job.get("is_repost") else 0,
+            "repost_of": job.get("repost_of"),
+            "repost_gap_days": job.get("repost_gap_days"),
             "status": job.get("status", "new"),
             "first_seen": job.get("first_seen") or datetime.utcnow().isoformat(),
         },
