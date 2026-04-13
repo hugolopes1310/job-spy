@@ -65,6 +65,40 @@ Les listes peuvent être vides ([]) si rien de notable. Les champs null si info 
 """
 
 
+def _build_feedback_context(limit_each: int = 5) -> str:
+    """Fetch recent user feedback from the DB and format as few-shot context.
+
+    Returns a string to append to the system prompt. Fails soft — if the DB is
+    not reachable or no feedback exists yet, returns an empty string.
+    """
+    try:
+        from db import DB_PATH, connect, fetch_recent_feedback_examples
+    except Exception:
+        return ""
+    try:
+        with connect(DB_PATH) as c:
+            good = fetch_recent_feedback_examples(c, "good", limit_each)
+            applied = fetch_recent_feedback_examples(c, "applied", limit_each)
+            bad = fetch_recent_feedback_examples(c, "bad", limit_each)
+    except Exception:
+        return ""
+    if not (good or applied or bad):
+        return ""
+    parts = ["", "Retour utilisateur sur les offres passées — utilise ces patterns :"]
+    for row in applied:
+        parts.append(f"  ✅ APPLIED : « {row['title']} » @ {row['company']} ({row['location']}) — axe={row['axe']}")
+    for row in good:
+        parts.append(f"  👍 GOOD : « {row['title']} » @ {row['company']} ({row['location']}) — axe={row['axe']}")
+    for row in bad:
+        parts.append(f"  👎 BAD (à ne PAS recommander) : « {row['title']} » @ {row['company']} ({row['location']}) — axe={row['axe']}")
+    parts.append(
+        "Si l'offre ressemble à un pattern BAD (titre/société/axe proches), "
+        "baisse le score. Si elle ressemble à un pattern GOOD/APPLIED, "
+        "n'hésite pas à monter le score."
+    )
+    return "\n".join(parts)
+
+
 def analyze_offer(title: str, company: str, location: str, description: str) -> dict | None:
     """Call Groq and return the rich analysis dict, or None on failure."""
     api_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GEMINI_API_KEY")
@@ -77,10 +111,12 @@ def analyze_offer(title: str, company: str, location: str, description: str) -> 
         f"Lieu : {location}\n"
         f"Description :\n{description[:2500]}"
     )
+    feedback_context = _build_feedback_context()
+    system = SYSTEM_PROMPT + (feedback_context or "")
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": user_msg},
         ],
         "temperature": 0.15,

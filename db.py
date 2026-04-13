@@ -45,6 +45,22 @@ CREATE TABLE IF NOT EXISTS companies (
     enrichment    TEXT,                -- JSON blob (size, positioning, news, etc.)
     created_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      TEXT NOT NULL,
+    action      TEXT NOT NULL,           -- 'good' | 'bad' | 'applied'
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_job_id ON feedback(job_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_action ON feedback(action);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at);
+
+CREATE TABLE IF NOT EXISTS telegram_state (
+    key    TEXT PRIMARY KEY,
+    value  TEXT
+);
 """
 
 MIGRATIONS = [
@@ -113,6 +129,134 @@ def fetch_notified_last_week(conn):
         "SELECT * FROM jobs WHERE status = 'notified' AND notified_at > ? ORDER BY score DESC, notified_at DESC",
         (cutoff,),
     ).fetchall()
+
+
+def save_feedback(conn, job_id: str, action: str) -> None:
+    """Record a user feedback action on a job (good/bad/applied).
+
+    Idempotent: avoid duplicates for the same (job_id, action).
+    """
+    existing = conn.execute(
+        "SELECT 1 FROM feedback WHERE job_id = ? AND action = ?",
+        (job_id, action),
+    ).fetchone()
+    if existing:
+        return
+    conn.execute(
+        "INSERT INTO feedback (job_id, action, created_at) VALUES (?, ?, ?)",
+        (job_id, action, datetime.utcnow().isoformat()),
+    )
+
+
+def get_feedback_for_job(conn, job_id: str) -> list[str]:
+    return [
+        r["action"]
+        for r in conn.execute(
+            "SELECT action FROM feedback WHERE job_id = ? ORDER BY created_at ASC",
+            (job_id,),
+        ).fetchall()
+    ]
+
+
+def fetch_recent_feedback_examples(conn, action: str, limit: int = 5):
+    """Return recent feedback rows joined with job metadata for few-shot prompting."""
+    return conn.execute(
+        """
+        SELECT j.title, j.company, j.location, j.axe, f.created_at
+        FROM feedback f
+        JOIN jobs j ON j.id = f.job_id
+        WHERE f.action = ?
+        ORDER BY f.created_at DESC
+        LIMIT ?
+        """,
+        (action, limit),
+    ).fetchall()
+
+
+def get_state(conn, key: str, default: str | None = None) -> str | None:
+    row = conn.execute(
+        "SELECT value FROM telegram_state WHERE key = ?", (key,)
+    ).fetchone()
+    return row["value"] if row else default
+
+
+def set_state(conn, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO telegram_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def monthly_feedback_stats(conn, year: int, month: int) -> dict:
+    """Return aggregate stats for a given month:
+       {notified, applied, good, bad, conversion_pct, avg_hours_to_apply,
+        by_axe: {axe: {notified, applied, good, bad}}}."""
+    from datetime import timedelta
+    start = datetime(year, month, 1)
+    if month == 12:
+        end = datetime(year + 1, 1, 1)
+    else:
+        end = datetime(year, month + 1, 1)
+    start_iso, end_iso = start.isoformat(), end.isoformat()
+
+    # Notified during the month
+    notified_rows = conn.execute(
+        "SELECT id, axe, notified_at FROM jobs "
+        "WHERE status = 'notified' AND notified_at >= ? AND notified_at < ?",
+        (start_iso, end_iso),
+    ).fetchall()
+    notified_total = len(notified_rows)
+    by_axe: dict[str, dict[str, int]] = {}
+    notified_by_id = {}
+    for r in notified_rows:
+        axe = r["axe"] or "?"
+        d = by_axe.setdefault(axe, {"notified": 0, "applied": 0, "good": 0, "bad": 0})
+        d["notified"] += 1
+        notified_by_id[r["id"]] = (axe, r["notified_at"])
+
+    # Feedback during the month (we count the feedback date, not the job date,
+    # to match "this month's user activity").
+    fb_rows = conn.execute(
+        "SELECT job_id, action, created_at FROM feedback "
+        "WHERE created_at >= ? AND created_at < ?",
+        (start_iso, end_iso),
+    ).fetchall()
+    applied, good, bad = 0, 0, 0
+    delays_hours: list[float] = []
+    for f in fb_rows:
+        action = f["action"]
+        if action == "applied":
+            applied += 1
+        elif action == "good":
+            good += 1
+        elif action == "bad":
+            bad += 1
+        if action in ("applied", "good", "bad"):
+            axe_info = notified_by_id.get(f["job_id"])
+            if axe_info:
+                axe, notified_at = axe_info
+                d = by_axe.setdefault(axe, {"notified": 0, "applied": 0, "good": 0, "bad": 0})
+                d[action] = d.get(action, 0) + 1
+                if action == "applied" and notified_at:
+                    try:
+                        dt_n = datetime.fromisoformat(notified_at)
+                        dt_a = datetime.fromisoformat(f["created_at"])
+                        delays_hours.append((dt_a - dt_n).total_seconds() / 3600.0)
+                    except ValueError:
+                        pass
+
+    conv_pct = (applied / notified_total * 100.0) if notified_total else 0.0
+    avg_hours = (sum(delays_hours) / len(delays_hours)) if delays_hours else 0.0
+    return {
+        "notified": notified_total,
+        "applied": applied,
+        "good": good,
+        "bad": bad,
+        "conversion_pct": round(conv_pct, 1),
+        "avg_hours_to_apply": round(avg_hours, 1),
+        "by_axe": by_axe,
+    }
 
 
 def normalize(text: str) -> str:

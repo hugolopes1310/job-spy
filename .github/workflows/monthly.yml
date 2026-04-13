@@ -1,0 +1,30 @@
+name: Monthly Funnel Stats
+
+on:
+  schedule:
+    # 1st of the month at 08:00 UTC = 10:00 France (CEST)
+    - cron: '0 8 1 * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: job-tracker-monthly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run monthly stats
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monthly_stats.py

@@ -20,7 +20,12 @@ def _env(cfg_section: dict, key: str) -> str | None:
     return cfg_section.get(key)
 
 
-def send_telegram(cfg: dict, text: str, disable_preview: bool = True) -> bool:
+def send_telegram(
+    cfg: dict,
+    text: str,
+    disable_preview: bool = True,
+    reply_markup: dict | None = None,
+) -> bool:
     token = _env(cfg, "bot_token")
     chat_id = _env(cfg, "chat_id")
     if not token or not chat_id:
@@ -34,6 +39,8 @@ def send_telegram(cfg: dict, text: str, disable_preview: bool = True) -> bool:
         "parse_mode": "Markdown",
         "disable_web_page_preview": disable_preview,
     }
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
     data = urllib.parse.urlencode(payload).encode()
     try:
         with urllib.request.urlopen(url, data=data, timeout=10) as r:
@@ -45,6 +52,18 @@ def send_telegram(cfg: dict, text: str, disable_preview: bool = True) -> bool:
     except Exception as e:  # noqa: BLE001
         print(f"[notifier] Telegram exception: {e}")
         return False
+
+
+def feedback_keyboard(job_id: str) -> dict:
+    """Inline keyboard with 👍 / 👎 / ✅ Applied — callback_data carries the job id short prefix."""
+    jid = job_id[:16]  # Telegram callback_data limited to 64 bytes, prefix is enough
+    return {
+        "inline_keyboard": [[
+            {"text": "👍 Good", "callback_data": f"good:{jid}"},
+            {"text": "👎 Bad", "callback_data": f"bad:{jid}"},
+            {"text": "✅ Applied", "callback_data": f"applied:{jid}"},
+        ]]
+    }
 
 
 def format_job_message(

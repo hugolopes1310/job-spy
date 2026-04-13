@@ -42,7 +42,7 @@ from db import (
     save_llm_analysis,
     stats,
 )
-from notifier import format_job_message, send_telegram
+from notifier import feedback_keyboard, format_job_message, send_telegram
 from scorer import score_job
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -405,7 +405,7 @@ def run_notify(cfg: dict) -> int:
                 cl_fr_url=cl_fr_url, cl_en_url=cl_en_url,
                 analysis=analysis, company_enrichment=company_enrichment,
             )
-            ok = send_telegram(tg_cfg, msg)
+            ok = send_telegram(tg_cfg, msg, reply_markup=feedback_keyboard(row["id"]))
             if ok:
                 mark_notified(conn, row["id"])
                 sent += 1
@@ -419,6 +419,13 @@ def run_notify(cfg: dict) -> int:
 
 
 def cmd_once(cfg: dict) -> None:
+    # Drain any pending Telegram feedback (button taps / slash commands) first,
+    # so the LLM has the latest user signals to condition on.
+    try:
+        from feedback_poller import poll_once
+        poll_once(cfg)
+    except Exception as e:  # noqa: BLE001
+        print(f"[tracker] feedback poll failed (non-fatal): {e}")
     run_scrape(cfg)
     run_notify(cfg)
 
