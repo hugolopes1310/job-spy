@@ -79,6 +79,7 @@ def score_with_llm(title: str, company: str, location: str, description: str) ->
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
+        "User-Agent": "job-tracker/1.0",
     }
 
     # Retry with exponential backoff on rate limit (429) / transient errors
@@ -102,7 +103,11 @@ def score_with_llm(title: str, company: str, location: str, description: str) ->
                 print(f"[llm] 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
                 time.sleep(wait)
                 continue
-            return -1, f"LLM error: HTTP {e.code}"
+            try:
+                err_body = e.read().decode()[:300]
+            except Exception:
+                err_body = ""
+            return -1, f"LLM error: HTTP {e.code} {err_body}"
         except Exception as e:  # noqa: BLE001
             return -1, f"LLM error: {e}"
     return -1, "LLM error: rate limit"
