@@ -99,7 +99,7 @@ def _build_letter(
 
     def add_recipient(text: str):
         p = doc.add_paragraph()
-        p.paragraph_format.left_indent = Cm(9)
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         p.paragraph_format.space_after = Pt(2)
         run = p.add_run(text)
         run.font.size = Pt(10)
