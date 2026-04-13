@@ -1,7 +1,10 @@
-"""Second-pass LLM scoring using Gemini Flash (free tier).
+"""Second-pass LLM scoring using Groq (free tier, Llama 3.3 70B).
 
 Called only on offers that already passed the keyword threshold.
 Returns a fit score (0-10) and a short explanation in French.
+
+Groq free tier: ~30 RPM, 14 400 RPD — largely enough for this use case.
+Compatible with the OpenAI Chat Completions API.
 """
 from __future__ import annotations
 
@@ -9,14 +12,10 @@ import json
 import os
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
-GEMINI_MODEL = "gemini-2.0-flash"
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 CV_SUMMARY = """
 Hugo Lopes — Structureur chez Altitude Investment Solutions (Genève).
@@ -50,53 +49,56 @@ Critères de scoring :
 
 
 def score_with_llm(title: str, company: str, location: str, description: str) -> tuple[int, str]:
-    """Call Gemini Flash to get a fit score + reason.
+    """Call Groq to get a fit score + reason.
 
     Returns (score, reason). On failure returns (-1, error_message).
+    Accepts GROQ_API_KEY; falls back to GEMINI_API_KEY name for backward compat.
     """
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return -1, "GEMINI_API_KEY not set"
+        return -1, "GROQ_API_KEY not set"
 
     user_msg = (
         f"Titre : {title}\n"
         f"Entreprise : {company}\n"
         f"Lieu : {location}\n"
-        f"Description :\n{description[:2000]}"  # cap to save tokens
+        f"Description :\n{description[:2000]}"
     )
 
     payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": SYSTEM_PROMPT + "\n\n" + user_msg}]}
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
         ],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 150,
-        },
+        "temperature": 0.1,
+        "max_tokens": 200,
+        "response_format": {"type": "json_object"},
     }
-
-    url = f"{GEMINI_URL}?key={api_key}"
     data = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
 
     # Retry with exponential backoff on rate limit (429) / transient errors
     max_attempts = 4
     for attempt in range(max_attempts):
         try:
             req = urllib.request.Request(
-                url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+                GROQ_URL, data=data, headers=headers, method="POST"
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
                 body = json.loads(resp.read().decode())
-            text = body["candidates"][0]["content"]["parts"][0]["text"]
-            text = text.strip()
+            text = body["choices"][0]["message"]["content"].strip()
             if text.startswith("```"):
                 text = text.split("\n", 1)[1]
                 text = text.rsplit("```", 1)[0]
-            result = json.loads(text.strip())
+            result = json.loads(text)
             return int(result["score"]), result.get("reason", "")
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < max_attempts - 1:
-                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s
+                wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
                 print(f"[llm] 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
                 time.sleep(wait)
                 continue

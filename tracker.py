@@ -143,7 +143,7 @@ def run_notify(cfg: dict) -> int:
     try:
         from llm_scorer import score_with_llm
         import os
-        llm_available = bool(os.environ.get("GEMINI_API_KEY"))
+        llm_available = bool(os.environ.get("GROQ_API_KEY") or os.environ.get("GEMINI_API_KEY"))
     except ImportError:
         llm_available = False
 
