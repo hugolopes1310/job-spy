@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -91,6 +92,10 @@ def poll_once(cfg: dict) -> int:
             if cq:
                 data = cq.get("data") or ""
                 callback_id = cq["id"]
+                msg_ref = cq.get("message") or {}
+                chat_id = (msg_ref.get("chat") or {}).get("id")
+                message_id = msg_ref.get("message_id")
+                saved_this = False
                 if ":" in data:
                     action, prefix = data.split(":", 1)
                     if action in VALID_ACTIONS:
@@ -98,24 +103,56 @@ def poll_once(cfg: dict) -> int:
                         if jid:
                             save_feedback(conn, jid, action)
                             saved += 1
+                            saved_this = True
                             answer_text = {
                                 "good": "👍 Noté (good)",
                                 "bad": "👎 Noté (bad) — pattern à éviter",
                                 "applied": "✅ Applied enregistré",
                             }[action]
+                            confirm_label = {
+                                "good": "👍 Good — enregistré",
+                                "bad": "👎 Bad — enregistré",
+                                "applied": "✅ Applied — enregistré",
+                            }[action]
                         else:
                             answer_text = "❓ Offre introuvable"
+                            confirm_label = None
                     else:
                         answer_text = "Action inconnue"
+                        confirm_label = None
                 else:
                     answer_text = "Callback malformé"
+                    confirm_label = None
+
+                # Best-effort toast (may 400 if callback expired — non-fatal)
                 try:
                     _tg_api(token, "answerCallbackQuery", {
                         "callback_query_id": callback_id,
                         "text": answer_text,
                     }, post=True)
+                except urllib.error.HTTPError as e:
+                    if e.code != 400:
+                        print(f"[poller] answerCallbackQuery failed: {e}")
                 except Exception as e:  # noqa: BLE001
                     print(f"[poller] answerCallbackQuery failed: {e}")
+
+                # Persistent confirmation: replace the inline keyboard on the
+                # original message with a single disabled chip showing the
+                # action taken. This survives callback TTL.
+                if saved_this and chat_id and message_id and confirm_label:
+                    new_markup = {
+                        "inline_keyboard": [[
+                            {"text": confirm_label, "callback_data": "noop"}
+                        ]]
+                    }
+                    try:
+                        _tg_api(token, "editMessageReplyMarkup", {
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "reply_markup": json.dumps(new_markup),
+                        }, post=True)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[poller] editMessageReplyMarkup failed: {e}")
 
             # Slash-command support (optional: /applied <jobid>)
             msg = upd.get("message")
