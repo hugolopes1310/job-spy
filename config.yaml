@@ -26,7 +26,9 @@ repost:
 extra_sources:
   enabled: true
   wttj:
-    enabled: true
+    # Disabled: the hard-coded Algolia app id no longer resolves (DNS).
+    # Re-enable after extracting a fresh app id from WTTJ's network tab.
+    enabled: false
     queries:
       - {search: "structurer", location: "Paris", axe: "X-WTTJ — structurer Paris", limit: 25}
       - {search: "structured products", location: "Paris", axe: "X-WTTJ — SP Paris", limit: 15}
@@ -42,7 +44,9 @@ extra_sources:
       - {search: "cross asset", location: "Zurich", axe: "X-JobUp — CA Zurich", limit: 15}
       - {search: "investment solutions", location: "Geneva", axe: "X-JobUp — IS Geneva", limit: 15}
   efc:
-    enabled: true
+    # Disabled: returns HTTP 500 on our requests (WAF/UA block).
+    # Re-enable after switching to Playwright or verifying a working endpoint.
+    enabled: false
     queries:
       - {search: "structured products", location: "Geneva", axe: "X-EFC — SP Geneva", limit: 15}
       - {search: "equity derivatives", location: "Zurich", axe: "X-EFC — ED Zurich", limit: 15}
@@ -60,15 +64,19 @@ company_feeds:
   enabled: true
   max_age_days: 14
   companies:
-    # Consultancies & data/AI boutiques (Lyon AM/PE + Fintech)
+    # ✅ Verified working
     - {name: "Artefact", ats: "greenhouse", slug: "artefact", axe: "F-Feed — Artefact"}
     - {name: "Ekimetrics", ats: "lever", slug: "ekimetrics", axe: "F-Feed — Ekimetrics"}
-    - {name: "Shift Technology", ats: "lever", slug: "shift-technology", axe: "F-Feed — Shift"}
-    - {name: "Sia Partners", ats: "smartrecruiters", slug: "SiaPartners1", axe: "F-Feed — Sia"}
-    # PE / AM
-    - {name: "Eurazeo", ats: "smartrecruiters", slug: "Eurazeo", axe: "F-Feed — Eurazeo"}
-    - {name: "Tikehau Capital", ats: "smartrecruiters", slug: "TikehauCapital", axe: "F-Feed — Tikehau"}
-    - {name: "Ardian", ats: "smartrecruiters", slug: "Ardian", axe: "F-Feed — Ardian"}
+    # Candidate slugs — to verify by visiting the target URL once:
+    #   greenhouse : https://boards.greenhouse.io/<slug>
+    #   lever      : https://jobs.lever.co/<slug>
+    #   smartrec.  : https://jobs.smartrecruiters.com/<slug>
+    - {name: "Shift Technology", ats: "lever", slug: "shifttechnology", axe: "F-Feed — Shift"}
+    # The following SmartRecruiters slugs returned empty — confirm their real ATS:
+    # - {name: "Sia Partners", ats: "smartrecruiters", slug: "SiaPartners1", axe: "F-Feed — Sia"}
+    # - {name: "Eurazeo", ats: "smartrecruiters", slug: "Eurazeo", axe: "F-Feed — Eurazeo"}
+    # - {name: "Tikehau Capital", ats: "smartrecruiters", slug: "TikehauCapital", axe: "F-Feed — Tikehau"}
+    # - {name: "Ardian", ats: "smartrecruiters", slug: "Ardian", axe: "F-Feed — Ardian"}
 
 cover_letter:
   enabled: true
