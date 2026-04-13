@@ -1,10 +1,13 @@
-"""Second-pass LLM scoring using Groq (free tier, Llama 3.3 70B).
+"""Structured offer analysis via Groq (Llama 3.3 70B).
 
-Called only on offers that already passed the keyword threshold.
-Returns a fit score (0-10) and a short explanation in French.
+Returns a rich dict combining:
+  - overall fit score (0-10)
+  - structured sub-scores (technique, geo, seniorite)
+  - red flags and atouts (useful for interview prep)
+  - extracted facts (salary, stack, contact, deadline, ATS keywords, apply hint)
 
-Groq free tier: ~30 RPM, 14 400 RPD — largely enough for this use case.
-Compatible with the OpenAI Chat Completions API.
+Backward-compat: `score_with_llm(title, company, location, description) -> (score, reason)`
+is kept as a thin wrapper over `analyze_offer()`.
 """
 from __future__ import annotations
 
@@ -18,61 +21,70 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 CV_SUMMARY = """
-Hugo Lopes — Structureur chez Altitude Investment Solutions (Genève).
-- MSc Finance SKEMA Business School (FT #1 Master in Finance 2025)
-- MSc Ingénieur Polytech Nice Sophia (Mathématiques Appliquées & Modélisation)
-- Expérience : structuration produits (Autocall, Phoenix, Reverse Convertible, CLN,
-  Callable, At-Risk Participation, Twin-Win, produits de taux), pricing multi-émetteurs,
-  RFQ, brochures commerciales, outils internes Python/VBA.
-- Projet K2 : déploiement full-stack (Python, GenAI/LLM, REST API, chatbot, RAG,
-  Nginx, OVH Cloud, Cloudflare). Automatisation brochures (-90%), onboarding (-90%),
-  billing (-90%), optimisation paniers (+50%).
-- Recherche : structurés/cross-asset Genève-Zurich, AM/PE Lyon, fintech Lyon.
-- Langues : français natif, anglais courant, portugais natif.
+Hugo Lopes — Structureur Cross Asset Solutions chez Altitude Investment Solutions (Paris, CDI depuis janvier 2024).
+Expériences : Altitude (actuel) structureur cross-asset full spectrum (Autocall, Callable, CLN, Reverse Convertible,
+Twin-Win, payoffs de taux), pricing/RFQ auprès de 20+ banques, lifecycle, secondaire, plateforme interne full-stack
++ GenAI conçue seul (brochures -90%, onboarding -90%, billing -90%, basket opt +50%, chatbot RAG).
+Avant : Credit Suisse Wealth Management Paris (stage, Investment Advisor UHNW).
+Formation : MSc SKEMA FMI (2ᵉ mondial FT 2025, CFA L1+L2 coverage), Ingénieur Polytech Clermont-Ferrand Génie Civil.
+Compétences : Python, VBA, Bloomberg, GenAI/LLM, RAG, Nginx, OVH, Cloudflare.
+Langues : FR natif, EN C1 (TOEIC 965), PT+ES B2.
+Recherche : structurés/cross-asset Genève-Zurich, AM/PE Lyon, fintech Lyon. Pas Paris.
 """
 
-SYSTEM_PROMPT = f"""Tu es un recruteur spécialisé en finance de marché.
-Tu évalues la pertinence d'une offre d'emploi pour ce candidat :
+SYSTEM_PROMPT = f"""Tu es un recruteur senior en finance de marché qui évalue une offre pour ce candidat :
 
 {CV_SUMMARY}
 
-Réponds UNIQUEMENT en JSON valide avec cette structure :
-{{"score": <int 0-10>, "reason": "<1 phrase en français expliquant le score>"}}
+Tu dois produire une analyse structurée EN FRANÇAIS, au format JSON strict :
 
-Critères de scoring :
-- 9-10 : match parfait (structureur, cross-asset sales, equity derivatives à Genève/Zurich)
-- 7-8 : très pertinent (advisory, investment solutions, AM obligataire, PE mid-cap Lyon)
-- 5-6 : intéressant mais pas idéal (fintech finance, product manager finance)
-- 3-4 : lien indirect (tech pure avec composante finance, middle office évolué)
-- 0-2 : pas pertinent (middle office pur, ops, compliance, dev sans finance)
+{{
+  "score": <int 0-10>,                         // score global de fit
+  "reason": "<1 phrase FR synthèse>",
+  "match_technique": <int 0-10>,               // match compétences/produits (structurés, dérivés, python…)
+  "match_geo": <int 0-10>,                     // Genève/Zurich/Lyon = 10 ; Paris/autre = bas ; remote = neutre
+  "match_seniorite": <int 0-10>,               // 2 ans d'XP → 10 si junior-mid, 0 si senior/head of/MD
+  "red_flags": ["<3 max, très courts>"],       // ex: "Rôle senior 10+ ans", "100% back-office"
+  "atouts": ["<3 max, très courts>"],          // atouts à mettre en avant en entretien
+  "salary": "<string ou null>",                // ex: "€80-110k" ou null si absent
+  "stack": ["<techno/produit>", ...],          // ex: ["Python", "Bloomberg", "Autocall"]
+  "contact": "<string ou null>",               // ex: "John Smith, Head of Structuring" ou null
+  "deadline": "<YYYY-MM-DD ou string ou null>",
+  "ats_keywords": ["<mots-clés>", ...],        // 5-10 mots-clés à faire apparaître dans le CV
+  "apply_hint": "<string courte>"              // ex: "Apply via LinkedIn", "Via site carrière", "Easy Apply"
+}}
+
+Barème score global :
+- 9-10 : match parfait (structureur dérivés Genève/Zurich, cross-asset solutions Suisse)
+- 7-8 : très pertinent (advisory/investment solutions, AM obligataire, PE mid-cap Lyon, fintech Lyon avec finance)
+- 5-6 : intéressant mais un axe faible (geo ou seniorité ou produit décalé)
+- 3-4 : lien ténu
+- 0-2 : middle/back office, tech pur sans finance, rôle fiscal/juridique, assurance, courtier
+
+Les listes peuvent être vides ([]) si rien de notable. Les champs null si info absente. Ne rien inventer.
 """
 
 
-def score_with_llm(title: str, company: str, location: str, description: str) -> tuple[int, str]:
-    """Call Groq to get a fit score + reason.
-
-    Returns (score, reason). On failure returns (-1, error_message).
-    Accepts GROQ_API_KEY; falls back to GEMINI_API_KEY name for backward compat.
-    """
+def analyze_offer(title: str, company: str, location: str, description: str) -> dict | None:
+    """Call Groq and return the rich analysis dict, or None on failure."""
     api_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return -1, "GROQ_API_KEY not set"
+        return None
 
     user_msg = (
         f"Titre : {title}\n"
         f"Entreprise : {company}\n"
         f"Lieu : {location}\n"
-        f"Description :\n{description[:2000]}"
+        f"Description :\n{description[:2500]}"
     )
-
     payload = {
         "model": GROQ_MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ],
-        "temperature": 0.1,
-        "max_tokens": 200,
+        "temperature": 0.15,
+        "max_tokens": 700,
         "response_format": {"type": "json_object"},
     }
     data = json.dumps(payload).encode("utf-8")
@@ -82,32 +94,48 @@ def score_with_llm(title: str, company: str, location: str, description: str) ->
         "User-Agent": "job-tracker/1.0",
     }
 
-    # Retry with exponential backoff on rate limit (429) / transient errors
-    max_attempts = 4
-    for attempt in range(max_attempts):
+    for attempt in range(4):
         try:
-            req = urllib.request.Request(
-                GROQ_URL, data=data, headers=headers, method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            req = urllib.request.Request(GROQ_URL, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 body = json.loads(resp.read().decode())
             text = body["choices"][0]["message"]["content"].strip()
             if text.startswith("```"):
-                text = text.split("\n", 1)[1]
-                text = text.rsplit("```", 1)[0]
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0]
             result = json.loads(text)
-            return int(result["score"]), result.get("reason", "")
+            # Ensure required keys + types
+            result.setdefault("score", 0)
+            result.setdefault("reason", "")
+            for k in ("match_technique", "match_geo", "match_seniorite"):
+                result.setdefault(k, -1)
+            for k in ("red_flags", "atouts", "stack", "ats_keywords"):
+                v = result.get(k)
+                if not isinstance(v, list):
+                    result[k] = []
+            for k in ("salary", "contact", "deadline", "apply_hint"):
+                result.setdefault(k, None)
+            return result
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < max_attempts - 1:
-                wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
-                print(f"[llm] 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
+            if e.code == 429 and attempt < 3:
+                wait = 5 * (2 ** attempt)
+                print(f"[llm] 429 rate limit, retry in {wait}s")
                 time.sleep(wait)
                 continue
             try:
-                err_body = e.read().decode()[:300]
+                err_body = e.read().decode()[:200]
             except Exception:
                 err_body = ""
-            return -1, f"LLM error: HTTP {e.code} {err_body}"
+            print(f"[llm] HTTP {e.code}: {err_body}")
+            return None
         except Exception as e:  # noqa: BLE001
-            return -1, f"LLM error: {e}"
-    return -1, "LLM error: rate limit"
+            print(f"[llm] error: {e}")
+            return None
+    return None
+
+
+def score_with_llm(title: str, company: str, location: str, description: str):
+    """Backward-compat wrapper. Returns (score, reason), -1 on failure."""
+    result = analyze_offer(title, company, location, description)
+    if result is None:
+        return -1, "LLM error"
+    return int(result.get("score", 0)), str(result.get("reason", ""))

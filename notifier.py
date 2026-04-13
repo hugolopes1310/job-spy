@@ -53,6 +53,8 @@ def format_job_message(
     llm_reason: str = "",
     cl_fr_url: str = "",
     cl_en_url: str = "",
+    analysis: dict | None = None,
+    company_enrichment: dict | None = None,
 ) -> str:
     """Format one SQLite row as a Markdown Telegram message.
 
@@ -85,6 +87,66 @@ def format_job_message(
     lines.append(f"🎯 {esc(axe)}")
     if llm_reason and not llm_reason.startswith("LLM error"):
         lines.append(f"💡 {esc(llm_reason)}")
+
+    # Structured sub-scores + atouts + red flags
+    if analysis:
+        sub = []
+        for key, label in [
+            ("match_technique", "tech"),
+            ("match_geo", "geo"),
+            ("match_seniorite", "sen"),
+        ]:
+            v = analysis.get(key)
+            if isinstance(v, int) and v >= 0:
+                sub.append(f"{label}:{v}")
+        if sub:
+            lines.append(f"📈 {' · '.join(sub)}")
+
+        atouts = analysis.get("atouts") or []
+        if atouts:
+            lines.append(f"✅ {esc(' · '.join(atouts[:3]))}")
+        red_flags = analysis.get("red_flags") or []
+        if red_flags:
+            lines.append(f"⚠️ {esc(' · '.join(red_flags[:2]))}")
+
+        facts = []
+        if analysis.get("salary"):
+            facts.append(f"💰 {esc(analysis['salary'])}")
+        if analysis.get("deadline"):
+            facts.append(f"📅 {esc(analysis['deadline'])}")
+        if analysis.get("contact"):
+            facts.append(f"👤 {esc(analysis['contact'])}")
+        if facts:
+            lines.append(" · ".join(facts))
+
+        stack = analysis.get("stack") or []
+        if stack:
+            lines.append(f"🧰 {esc(' · '.join(stack[:6]))}")
+        ats = analysis.get("ats_keywords") or []
+        if ats:
+            lines.append(f"🏷️ ATS: {esc(', '.join(ats[:8]))}")
+        if analysis.get("apply_hint"):
+            lines.append(f"➡️ {esc(analysis['apply_hint'])}")
+
+    # Company mini-fiche (first time we see this company)
+    if company_enrichment:
+        ce_parts = []
+        if company_enrichment.get("type"):
+            ce_parts.append(esc(company_enrichment["type"]))
+        if company_enrichment.get("size"):
+            ce_parts.append(esc(company_enrichment["size"]))
+        header = " · ".join(ce_parts)
+        if header or company_enrichment.get("positioning"):
+            lines.append("")
+            lines.append(f"🏷 *Company* {header}")
+            if company_enrichment.get("positioning"):
+                lines.append(f"  _{esc(company_enrichment['positioning'])}_")
+            if company_enrichment.get("relevance"):
+                lines.append(f"  🎯 {esc(company_enrichment['relevance'])}")
+            issues = company_enrichment.get("known_issues") or []
+            if issues:
+                lines.append(f"  ⚠️ {esc(' · '.join(issues[:2]))}")
+
     lines.append(f"🔗 {url}")
     if cl_fr_url or cl_en_url:
         cl_parts = []

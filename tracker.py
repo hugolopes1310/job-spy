@@ -10,24 +10,35 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import sys
 import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
+
+def _os_env(name: str):
+    return os.environ.get(name)
+
 import yaml
+
+import json as _json
 
 from db import (
     DB_PATH,
     connect,
     fetch_new_above,
+    fetch_recent_titles_for_company,
     fingerprint_exists,
+    get_company,
     init_db,
     insert_job,
     job_exists,
     make_fingerprint,
     mark_notified,
+    save_company,
+    save_llm_analysis,
     stats,
 )
 from notifier import format_job_message, send_telegram
@@ -54,6 +65,17 @@ def run_scrape(cfg: dict) -> int:
             "[tracker] jobspy is not installed. Run: pip install python-jobspy pyyaml"
         )
         sys.exit(1)
+
+    # Optional semantic dedup (requires Groq)
+    sem_cfg = cfg.get("semantic_dedup", {}) or {}
+    sem_enabled = bool(sem_cfg.get("enabled", False)) and bool(
+        _os_env("GROQ_API_KEY") or _os_env("GEMINI_API_KEY")
+    )
+    if sem_enabled:
+        try:
+            from semantic_dedup import is_semantic_duplicate
+        except ImportError:
+            sem_enabled = False
 
     new_count = 0
     with connect(DB_PATH) as conn:
@@ -109,6 +131,13 @@ def run_scrape(cfg: dict) -> int:
                 if fingerprint_exists(conn, fp):
                     continue
 
+                # Dedup 3 (optional): semantic — same company reworded
+                if sem_enabled and company:
+                    existing = [r["title"] for r in fetch_recent_titles_for_company(conn, company)]
+                    if existing and is_semantic_duplicate(title, existing):
+                        print(f"[tracker]   semantic dup skipped: {title} @ {company}")
+                        continue
+
                 job = {
                     "id": jid,
                     "fingerprint": fp,
@@ -135,19 +164,27 @@ def run_scrape(cfg: dict) -> int:
 
 
 def run_notify(cfg: dict) -> int:
-    """Push every new offer above threshold to Telegram, with optional LLM scoring."""
+    """Push every new offer above threshold to Telegram, with rich LLM analysis."""
     threshold = int(cfg.get("scoring", {}).get("notify_threshold", 5))
     llm_threshold = int(cfg.get("scoring", {}).get("llm_min_score", 5))
-    cl_threshold = int(cfg.get("scoring", {}).get("cover_letter_min_ai", 99))  # 99 = disabled
+    cl_threshold = int(cfg.get("scoring", {}).get("cover_letter_min_ai", 99))
     tg_cfg = cfg.get("telegram", {})
 
-    # Try to import LLM scorer (optional — works without it)
+    # LLM: structured analysis
     try:
-        from llm_scorer import score_with_llm
-        import os
-        llm_available = bool(os.environ.get("GROQ_API_KEY") or os.environ.get("GEMINI_API_KEY"))
+        from llm_scorer import analyze_offer
+        llm_available = bool(_os_env("GROQ_API_KEY") or _os_env("GEMINI_API_KEY"))
     except ImportError:
         llm_available = False
+        analyze_offer = None  # type: ignore
+
+    # Company enrichment
+    enrich_available = llm_available
+    if enrich_available:
+        try:
+            from company_enrichment import enrich_company
+        except ImportError:
+            enrich_available = False
 
     # Cover letter setup
     cl_cfg = cfg.get("cover_letter", {}) or {}
@@ -168,25 +205,45 @@ def run_notify(cfg: dict) -> int:
         rows = fetch_new_above(conn, threshold)
         print(f"[tracker] {len(rows)} offer(s) above keyword threshold {threshold}")
         if llm_available:
-            print(f"[tracker] LLM scoring enabled (Groq Llama 3.3 70B) — min AI score: {llm_threshold}")
+            print(f"[tracker] LLM analysis enabled (Groq Llama 3.3 70B) — min AI score: {llm_threshold}")
 
         for row in rows:
             llm_score = -1
             llm_reason = ""
+            analysis = None
 
-            # Second pass: LLM fit scoring
+            # Structured LLM analysis (score + sub-scores + extraction)
             if llm_available:
-                llm_score, llm_reason = score_with_llm(
+                analysis = analyze_offer(
                     title=row["title"] or "",
                     company=row["company"] or "",
                     location=row["location"] or "",
                     description=row["description"] or "",
                 )
+                if analysis:
+                    llm_score = int(analysis.get("score", 0))
+                    llm_reason = str(analysis.get("reason", ""))
+                    save_llm_analysis(conn, row["id"], _json.dumps(analysis, ensure_ascii=False))
+                else:
+                    llm_reason = "LLM error"
                 print(f"[tracker]   AI score {llm_score}/10 for: {row['title']} @ {row['company']}")
                 if llm_score >= 0 and llm_score < llm_threshold:
-                    mark_notified(conn, row["id"])  # mark as processed, don't notify
+                    mark_notified(conn, row["id"])  # processed, skip notification
                     skipped_by_llm += 1
                     continue
+
+            # Company enrichment (first time we see the company)
+            company_enrichment = None
+            company_name = (row["company"] or "").strip()
+            if enrich_available and company_name:
+                existing = get_company(conn, company_name)
+                if existing is None:
+                    enriched = enrich_company(company_name)
+                    if enriched:
+                        save_company(conn, company_name, _json.dumps(enriched, ensure_ascii=False))
+                        company_enrichment = enriched
+                    time.sleep(1)  # small buffer
+                # else: we don't re-display for subsequent offers from same company
 
             # Cover letter generation for strong matches
             cl_fr_url = cl_en_url = ""
@@ -220,6 +277,7 @@ def run_notify(cfg: dict) -> int:
             msg = format_job_message(
                 row, llm_score=llm_score, llm_reason=llm_reason,
                 cl_fr_url=cl_fr_url, cl_en_url=cl_en_url,
+                analysis=analysis, company_enrichment=company_enrichment,
             )
             ok = send_telegram(tg_cfg, msg)
             if ok:

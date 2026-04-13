@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     site           TEXT,
     score          INTEGER NOT NULL DEFAULT 0,
     score_reasons  TEXT,
+    llm_analysis   TEXT,                        -- JSON blob from structured Groq call
     status         TEXT NOT NULL DEFAULT 'new',
     first_seen     TEXT NOT NULL,
     notified_at    TEXT
@@ -34,11 +35,19 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status      ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_axe         ON jobs(axe);
 CREATE INDEX IF NOT EXISTS idx_jobs_score       ON jobs(score);
 CREATE INDEX IF NOT EXISTS idx_jobs_fingerprint ON jobs(fingerprint);
+
+CREATE TABLE IF NOT EXISTS companies (
+    name          TEXT PRIMARY KEY,   -- normalized company name
+    display_name  TEXT,
+    enrichment    TEXT,                -- JSON blob (size, positioning, news, etc.)
+    created_at    TEXT NOT NULL
+);
 """
 
-MIGRATE_FINGERPRINT = """
-ALTER TABLE jobs ADD COLUMN fingerprint TEXT;
-"""
+MIGRATIONS = [
+    "ALTER TABLE jobs ADD COLUMN fingerprint TEXT",
+    "ALTER TABLE jobs ADD COLUMN llm_analysis TEXT",
+]
 
 
 @contextmanager
@@ -55,11 +64,49 @@ def connect(db_path: Path = DB_PATH):
 def init_db(db_path: Path = DB_PATH) -> None:
     with connect(db_path) as c:
         c.executescript(SCHEMA)
-        # migrate older DBs that don't have fingerprint column
-        try:
-            c.execute(MIGRATE_FINGERPRINT)
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        for stmt in MIGRATIONS:
+            try:
+                c.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+
+def save_llm_analysis(conn, job_id: str, analysis_json: str) -> None:
+    conn.execute("UPDATE jobs SET llm_analysis = ? WHERE id = ?", (analysis_json, job_id))
+
+
+def get_company(conn, name: str):
+    return conn.execute(
+        "SELECT * FROM companies WHERE name = ?", (normalize(name),),
+    ).fetchone()
+
+
+def save_company(conn, display_name: str, enrichment_json: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO companies (name, display_name, enrichment, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (normalize(display_name), display_name, enrichment_json, datetime.utcnow().isoformat()),
+    )
+
+
+def fetch_recent_titles_for_company(conn, company: str, days: int = 14):
+    """Return (id, title) for rows from same company in last N days (for semantic dedup)."""
+    from datetime import timedelta
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    return conn.execute(
+        "SELECT id, title FROM jobs WHERE company = ? AND first_seen > ? ORDER BY first_seen DESC",
+        (company, cutoff),
+    ).fetchall()
+
+
+def fetch_notified_last_week(conn):
+    """All rows notified in the last 7 days — used by the weekly summary."""
+    from datetime import timedelta
+    cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    return conn.execute(
+        "SELECT * FROM jobs WHERE status = 'notified' AND notified_at > ? ORDER BY score DESC, notified_at DESC",
+        (cutoff,),
+    ).fetchall()
 
 
 def normalize(text: str) -> str:

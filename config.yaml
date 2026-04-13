@@ -11,6 +11,9 @@ scoring:
   llm_min_score: 5       # AI score minimum (0-10) pour envoyer sur Telegram
   cover_letter_min_ai: 8 # AI score minimum pour générer la cover letter FR+EN
 
+semantic_dedup:
+  enabled: true    # uses ~1 extra Groq call when fingerprint miss + same-company recent titles exist
+
 cover_letter:
   enabled: true
   output_dir: "cover_letters"
