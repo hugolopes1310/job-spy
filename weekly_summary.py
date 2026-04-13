@@ -19,7 +19,15 @@ from pathlib import Path
 
 import yaml
 
-from db import DB_PATH, connect, fetch_notified_last_week
+from db import DB_PATH, connect, fetch_notified_last_week, init_db
+
+
+def _row_get(row, key, default=None):
+    """Safe access for sqlite3.Row that may not have the column."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
 from notifier import send_telegram
 
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -49,9 +57,10 @@ def build_summary_input(rows) -> str:
     lines = []
     for r in rows[:40]:  # cap to stay within token limits
         analysis = {}
-        if r["llm_analysis"]:
+        raw = _row_get(r, "llm_analysis")
+        if raw:
             try:
-                analysis = json.loads(r["llm_analysis"])
+                analysis = json.loads(raw)
             except Exception:
                 analysis = {}
         ai = analysis.get("score", "?")
@@ -102,6 +111,7 @@ def main() -> int:
     cfg = yaml.safe_load(open(cfg_path))
     tg_cfg = cfg.get("telegram", {})
 
+    init_db(DB_PATH)  # ensures llm_analysis column exists on older DBs
     with connect(DB_PATH) as conn:
         rows = fetch_notified_last_week(conn)
 
@@ -115,7 +125,7 @@ def main() -> int:
     strong_count = 0
     for r in rows:
         try:
-            a = json.loads(r["llm_analysis"] or "{}")
+            a = json.loads(_row_get(r, "llm_analysis") or "{}")
             if int(a.get("score", 0)) >= 8:
                 strong_count += 1
         except Exception:
