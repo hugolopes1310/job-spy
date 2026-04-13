@@ -47,7 +47,13 @@ def send_telegram(cfg: dict, text: str, disable_preview: bool = True) -> bool:
         return False
 
 
-def format_job_message(row, llm_score: int = -1, llm_reason: str = "") -> str:
+def format_job_message(
+    row,
+    llm_score: int = -1,
+    llm_reason: str = "",
+    cl_fr_url: str = "",
+    cl_en_url: str = "",
+) -> str:
     """Format one SQLite row as a Markdown Telegram message.
 
     If llm_score >= 0, adds the AI fit assessment.
@@ -80,5 +86,12 @@ def format_job_message(row, llm_score: int = -1, llm_reason: str = "") -> str:
     if llm_reason and not llm_reason.startswith("LLM error"):
         lines.append(f"💡 {esc(llm_reason)}")
     lines.append(f"🔗 {url}")
+    if cl_fr_url or cl_en_url:
+        cl_parts = []
+        if cl_fr_url:
+            cl_parts.append(f"[📝 CL FR]({cl_fr_url})")
+        if cl_en_url:
+            cl_parts.append(f"[📝 CL EN]({cl_en_url})")
+        lines.append("  •  ".join(cl_parts))
 
     return "\n".join(lines)

@@ -9,6 +9,19 @@ telegram:
 scoring:
   notify_threshold: 7
   llm_min_score: 5       # AI score minimum (0-10) pour envoyer sur Telegram
+  cover_letter_min_ai: 8 # AI score minimum pour générer la cover letter FR+EN
+
+cover_letter:
+  enabled: true
+  output_dir: "cover_letters"
+  # Repo public pour construire les raw URLs (utilisé par Telegram)
+  github_raw_base: "https://github.com/hugolopes1310/job-tracker/raw/main"
+  sender:
+    name: "Hugo LOPES"
+    address_line1: "73 Boulevard Victor Hugo"
+    address_line2: "92110 Clichy"
+    email: "lopeshugo@hotmail.fr"
+    phone: "+33 6 52 17 33 56"
 
   title_boost:
     structurer: 6

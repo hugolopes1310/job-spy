@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import sys
 import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -137,6 +138,7 @@ def run_notify(cfg: dict) -> int:
     """Push every new offer above threshold to Telegram, with optional LLM scoring."""
     threshold = int(cfg.get("scoring", {}).get("notify_threshold", 5))
     llm_threshold = int(cfg.get("scoring", {}).get("llm_min_score", 5))
+    cl_threshold = int(cfg.get("scoring", {}).get("cover_letter_min_ai", 99))  # 99 = disabled
     tg_cfg = cfg.get("telegram", {})
 
     # Try to import LLM scorer (optional — works without it)
@@ -146,6 +148,19 @@ def run_notify(cfg: dict) -> int:
         llm_available = bool(os.environ.get("GROQ_API_KEY") or os.environ.get("GEMINI_API_KEY"))
     except ImportError:
         llm_available = False
+
+    # Cover letter setup
+    cl_cfg = cfg.get("cover_letter", {}) or {}
+    cl_enabled = bool(cl_cfg.get("enabled", False)) and llm_available
+    cl_out_dir = Path(__file__).parent / cl_cfg.get("output_dir", "cover_letters")
+    cl_raw_base = (cl_cfg.get("github_raw_base") or "").rstrip("/")
+    if cl_enabled:
+        try:
+            from cover_letter import generate_cover_letter
+            from cover_letter_docx import write_cover_letters
+        except ImportError as e:
+            print(f"[tracker] Cover letter deps missing ({e}), disabling CL generation")
+            cl_enabled = False
 
     sent = 0
     skipped_by_llm = 0
@@ -173,13 +188,45 @@ def run_notify(cfg: dict) -> int:
                     skipped_by_llm += 1
                     continue
 
-            msg = format_job_message(row, llm_score=llm_score, llm_reason=llm_reason)
+            # Cover letter generation for strong matches
+            cl_fr_url = cl_en_url = ""
+            if cl_enabled and llm_score >= cl_threshold:
+                print(f"[tracker]   Generating cover letter (AI={llm_score}) for {row['title']} @ {row['company']}")
+                content = generate_cover_letter(
+                    title=row["title"] or "",
+                    company=row["company"] or "",
+                    location=row["location"] or "",
+                    description=row["description"] or "",
+                )
+                if content:
+                    try:
+                        fr_path, en_path = write_cover_letters(
+                            output_dir=cl_out_dir,
+                            job_id=row["id"],
+                            title=row["title"] or "job",
+                            company=row["company"] or "company",
+                            location=row["location"] or "",
+                            sender=cl_cfg.get("sender", {}),
+                            content=content,
+                        )
+                        if cl_raw_base:
+                            rel_fr = f"{cl_out_dir.name}/{fr_path.name}"
+                            rel_en = f"{cl_out_dir.name}/{en_path.name}"
+                            cl_fr_url = f"{cl_raw_base}/{urllib.parse.quote(rel_fr)}"
+                            cl_en_url = f"{cl_raw_base}/{urllib.parse.quote(rel_en)}"
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[tracker]   CL write failed: {e}")
+
+            msg = format_job_message(
+                row, llm_score=llm_score, llm_reason=llm_reason,
+                cl_fr_url=cl_fr_url, cl_en_url=cl_en_url,
+            )
             ok = send_telegram(tg_cfg, msg)
             if ok:
                 mark_notified(conn, row["id"])
                 sent += 1
 
-            # Respect Gemini free tier (15 RPM) — stay well under limit
+            # Stay well under Groq 30 RPM free tier
             if llm_available:
                 time.sleep(5)
 

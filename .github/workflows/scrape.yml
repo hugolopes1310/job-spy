@@ -48,6 +48,6 @@ jobs:
         run: |
           git config user.name "Job Tracker Bot"
           git config user.email "bot@noreply.github.com"
-          git add jobs.db || true
-          git diff --cached --quiet || git commit -m "Update jobs.db [skip ci]"
+          git add jobs.db cover_letters/ || true
+          git diff --cached --quiet || git commit -m "Update jobs.db + cover letters [skip ci]"
           git push
