@@ -11,85 +11,6 @@ scoring:
   llm_min_score: 5       # AI score minimum (0-10) pour envoyer sur Telegram
   cover_letter_min_ai: 8 # AI score minimum pour générer la cover letter FR+EN
 
-semantic_dedup:
-  enabled: true    # uses ~1 extra Groq call when fingerprint miss + same-company recent titles exist
-
-# Repost detection — same title+company resurfacing after a long gap is usually
-# a signal of turnover or unfilled position → penalty on the AI score.
-repost:
-  gap_days: 45          # below this: skip as duplicate. Above: flag as repost.
-  score_penalty: 2      # subtracted from AI score (0-10) when is_repost
-
-# =====================================================================
-# Extra scrapers (hors python-jobspy)
-# =====================================================================
-extra_sources:
-  enabled: true
-  wttj:
-    # Disabled: the hard-coded Algolia app id no longer resolves (DNS).
-    # Re-enable after extracting a fresh app id from WTTJ's network tab.
-    enabled: false
-    queries:
-      - {search: "structurer", location: "Paris", axe: "X-WTTJ — structurer Paris", limit: 25}
-      - {search: "structured products", location: "Paris", axe: "X-WTTJ — SP Paris", limit: 15}
-      - {search: "asset management", location: "Lyon", axe: "X-WTTJ — AM Lyon", limit: 20}
-      - {search: "private equity", location: "Lyon", axe: "X-WTTJ — PE Lyon", limit: 15}
-      - {search: "fintech", location: "Lyon", axe: "X-WTTJ — Fintech Lyon", limit: 15}
-  jobup:
-    enabled: true
-    queries:
-      - {search: "structured products", location: "Zurich", axe: "X-JobUp — SP Zurich", limit: 20}
-      - {search: "structured products", location: "Geneva", axe: "X-JobUp — SP Geneva", limit: 20}
-      - {search: "equity derivatives", location: "Geneva", axe: "X-JobUp — ED Geneva", limit: 15}
-      - {search: "cross asset", location: "Zurich", axe: "X-JobUp — CA Zurich", limit: 15}
-      - {search: "investment solutions", location: "Geneva", axe: "X-JobUp — IS Geneva", limit: 15}
-  efc:
-    # Disabled: returns HTTP 500 on our requests (WAF/UA block).
-    # Re-enable after switching to Playwright or verifying a working endpoint.
-    enabled: false
-    queries:
-      - {search: "structured products", location: "Geneva", axe: "X-EFC — SP Geneva", limit: 15}
-      - {search: "equity derivatives", location: "Zurich", axe: "X-EFC — ED Zurich", limit: 15}
-      - {search: "private equity", location: "Lyon", axe: "X-EFC — PE Lyon", limit: 15}
-
-# =====================================================================
-# Direct ATS feeds — zero-miss on target companies
-# =====================================================================
-# ats values: greenhouse | lever | smartrecruiters
-# slug : the identifier used in the ATS URL (e.g. boards.greenhouse.io/<slug>)
-# Les banques privées (Vontobel, Pictet, UBP, Lombard Odier, Julius Baer,
-# Mirabaud) utilisent Workday/SuccessFactors/Taleo — non supportés par un JSON
-# public. Elles restent couvertes via LinkedIn/Indeed/Google Jobs (axes A1-A13).
-company_feeds:
-  enabled: true
-  max_age_days: 14
-  companies:
-    # ✅ Verified working
-    - {name: "Artefact", ats: "greenhouse", slug: "artefact", axe: "F-Feed — Artefact"}
-    - {name: "Ekimetrics", ats: "lever", slug: "ekimetrics", axe: "F-Feed — Ekimetrics"}
-    # Candidate slugs — to verify by visiting the target URL once:
-    #   greenhouse : https://boards.greenhouse.io/<slug>
-    #   lever      : https://jobs.lever.co/<slug>
-    #   smartrec.  : https://jobs.smartrecruiters.com/<slug>
-    - {name: "Shift Technology", ats: "lever", slug: "shifttechnology", axe: "F-Feed — Shift"}
-    # The following SmartRecruiters slugs returned empty — confirm their real ATS:
-    # - {name: "Sia Partners", ats: "smartrecruiters", slug: "SiaPartners1", axe: "F-Feed — Sia"}
-    # - {name: "Eurazeo", ats: "smartrecruiters", slug: "Eurazeo", axe: "F-Feed — Eurazeo"}
-    # - {name: "Tikehau Capital", ats: "smartrecruiters", slug: "TikehauCapital", axe: "F-Feed — Tikehau"}
-    # - {name: "Ardian", ats: "smartrecruiters", slug: "Ardian", axe: "F-Feed — Ardian"}
-
-cover_letter:
-  enabled: true
-  output_dir: "cover_letters"
-  # Repo public pour construire les raw URLs (utilisé par Telegram)
-  github_raw_base: "https://github.com/hugolopes1310/job-tracker/raw/main"
-  sender:
-    name: "Hugo LOPES"
-    address_line1: "73 Boulevard Victor Hugo"
-    address_line2: "92110 Clichy"
-    email: "lopeshugo@hotmail.fr"
-    phone: "+33 6 52 17 33 56"
-
   title_boost:
     structurer: 6
     structureur: 6
@@ -206,6 +127,85 @@ cover_letter:
     suisse: 3
     lyon: 4
     "auvergne-rhône-alpes": 3
+
+semantic_dedup:
+  enabled: true    # uses ~1 extra Groq call when fingerprint miss + same-company recent titles exist
+
+# Repost detection — same title+company resurfacing after a long gap is usually
+# a signal of turnover or unfilled position → penalty on the AI score.
+repost:
+  gap_days: 45          # below this: skip as duplicate. Above: flag as repost.
+  score_penalty: 2      # subtracted from AI score (0-10) when is_repost
+
+# =====================================================================
+# Extra scrapers (hors python-jobspy)
+# =====================================================================
+extra_sources:
+  enabled: true
+  wttj:
+    # Disabled: the hard-coded Algolia app id no longer resolves (DNS).
+    # Re-enable after extracting a fresh app id from WTTJ's network tab.
+    enabled: false
+    queries:
+      - {search: "structurer", location: "Paris", axe: "X-WTTJ — structurer Paris", limit: 25}
+      - {search: "structured products", location: "Paris", axe: "X-WTTJ — SP Paris", limit: 15}
+      - {search: "asset management", location: "Lyon", axe: "X-WTTJ — AM Lyon", limit: 20}
+      - {search: "private equity", location: "Lyon", axe: "X-WTTJ — PE Lyon", limit: 15}
+      - {search: "fintech", location: "Lyon", axe: "X-WTTJ — Fintech Lyon", limit: 15}
+  jobup:
+    enabled: true
+    queries:
+      - {search: "structured products", location: "Zurich", axe: "X-JobUp — SP Zurich", limit: 20}
+      - {search: "structured products", location: "Geneva", axe: "X-JobUp — SP Geneva", limit: 20}
+      - {search: "equity derivatives", location: "Geneva", axe: "X-JobUp — ED Geneva", limit: 15}
+      - {search: "cross asset", location: "Zurich", axe: "X-JobUp — CA Zurich", limit: 15}
+      - {search: "investment solutions", location: "Geneva", axe: "X-JobUp — IS Geneva", limit: 15}
+  efc:
+    # Disabled: returns HTTP 500 on our requests (WAF/UA block).
+    # Re-enable after switching to Playwright or verifying a working endpoint.
+    enabled: false
+    queries:
+      - {search: "structured products", location: "Geneva", axe: "X-EFC — SP Geneva", limit: 15}
+      - {search: "equity derivatives", location: "Zurich", axe: "X-EFC — ED Zurich", limit: 15}
+      - {search: "private equity", location: "Lyon", axe: "X-EFC — PE Lyon", limit: 15}
+
+# =====================================================================
+# Direct ATS feeds — zero-miss on target companies
+# =====================================================================
+# ats values: greenhouse | lever | smartrecruiters
+# slug : the identifier used in the ATS URL (e.g. boards.greenhouse.io/<slug>)
+# Les banques privées (Vontobel, Pictet, UBP, Lombard Odier, Julius Baer,
+# Mirabaud) utilisent Workday/SuccessFactors/Taleo — non supportés par un JSON
+# public. Elles restent couvertes via LinkedIn/Indeed/Google Jobs (axes A1-A13).
+company_feeds:
+  enabled: true
+  max_age_days: 14
+  companies:
+    # ✅ Verified working
+    - {name: "Artefact", ats: "greenhouse", slug: "artefact", axe: "F-Feed — Artefact"}
+    - {name: "Ekimetrics", ats: "lever", slug: "ekimetrics", axe: "F-Feed — Ekimetrics"}
+    # Candidate slugs — to verify by visiting the target URL once:
+    #   greenhouse : https://boards.greenhouse.io/<slug>
+    #   lever      : https://jobs.lever.co/<slug>
+    #   smartrec.  : https://jobs.smartrecruiters.com/<slug>
+    - {name: "Shift Technology", ats: "lever", slug: "shifttechnology", axe: "F-Feed — Shift"}
+    # The following SmartRecruiters slugs returned empty — confirm their real ATS:
+    # - {name: "Sia Partners", ats: "smartrecruiters", slug: "SiaPartners1", axe: "F-Feed — Sia"}
+    # - {name: "Eurazeo", ats: "smartrecruiters", slug: "Eurazeo", axe: "F-Feed — Eurazeo"}
+    # - {name: "Tikehau Capital", ats: "smartrecruiters", slug: "TikehauCapital", axe: "F-Feed — Tikehau"}
+    # - {name: "Ardian", ats: "smartrecruiters", slug: "Ardian", axe: "F-Feed — Ardian"}
+
+cover_letter:
+  enabled: true
+  output_dir: "cover_letters"
+  # Repo public pour construire les raw URLs (utilisé par Telegram)
+  github_raw_base: "https://github.com/hugolopes1310/job-tracker/raw/main"
+  sender:
+    name: "Hugo LOPES"
+    address_line1: "73 Boulevard Victor Hugo"
+    address_line2: "92110 Clichy"
+    email: "lopeshugo@hotmail.fr"
+    phone: "+33 6 52 17 33 56"
 
 # =====================================================================
 # Search axes — multi-source (linkedin, indeed, google)
