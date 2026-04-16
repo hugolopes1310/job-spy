@@ -14,7 +14,7 @@ import os
 import sys
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -102,7 +102,7 @@ def _ingest_row(
         oldest_id, oldest_first_seen, _cnt = fp_status
         try:
             first_dt = datetime.fromisoformat(oldest_first_seen)
-            gap_days = (datetime.now(datetime.timezone.utc) - first_dt).days
+            gap_days = (datetime.now(timezone.utc) - first_dt).days
         except (ValueError, TypeError):
             gap_days = None
         if gap_days is not None and gap_days >= repost_gap_days:
@@ -135,7 +135,7 @@ def _ingest_row(
         "is_repost": is_repost,
         "repost_of": repost_of,
         "repost_gap_days": gap_days if is_repost else None,
-        "first_seen": datetime.now(datetime.timezone.utc).isoformat(),
+        "first_seen": datetime.now(timezone.utc).isoformat(),
     }
     s, reasons = score_job(job, cfg.get("scoring", {}))
     job["score"] = s
