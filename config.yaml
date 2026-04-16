@@ -7,7 +7,7 @@ telegram:
   chat_id_env: TELEGRAM_CHAT_ID
 
 scoring:
-  notify_threshold: 7
+  notify_threshold: 5
   llm_min_score: 5       # AI score minimum (0-10) pour envoyer sur Telegram
   cover_letter_min_ai: 8 # AI score minimum pour générer la cover letter FR+EN
 
