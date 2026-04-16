@@ -25,6 +25,9 @@ scoring:
     "investment advisor": 3
     "private equity": 3
     "private debt": 3
+    "banque privée": 3
+    "private banking": 3
+    "gestion d actifs": 3
     "quant": 2
     "quantitative": 2
     "derivatives": 3
@@ -152,6 +155,12 @@ extra_sources:
       - {search: "asset management", location: "Lyon", axe: "X-WTTJ — AM Lyon", limit: 20}
       - {search: "private equity", location: "Lyon", axe: "X-WTTJ — PE Lyon", limit: 15}
       - {search: "fintech", location: "Lyon", axe: "X-WTTJ — Fintech Lyon", limit: 15}
+      - {search: "banque privée", location: "Lyon", axe: "X-WTTJ — BP Lyon", limit: 15}
+      - {search: "private debt", location: "Lyon", axe: "X-WTTJ — PD Lyon", limit: 15}
+      - {search: "gestion d actifs", location: "Lyon", axe: "X-WTTJ — GA Lyon", limit: 15}
+      - {search: "banque privée", location: "Lyon", axe: "X-WTTJ — BP Lyon", limit: 15}
+      - {search: "private debt", location: "Lyon", axe: "X-WTTJ — PD Lyon", limit: 15}
+      - {search: "gestion d actifs", location: "Lyon", axe: "X-WTTJ — GA Lyon", limit: 15}
   jobup:
     enabled: true
     queries:
@@ -360,6 +369,44 @@ axes:
   - name: "C — Fintech Lyon"
     sites: [linkedin, indeed, google]
     search_term: "fintech"
+    location: "Lyon, France"
+    distance: 50
+    results_wanted: 25
+    hours_old: 24
+    country_indeed: france
+  # --- AXE D : Lyon — Banque Privée ---
+  - name: "D1 — Lyon banque privée"
+    sites: [linkedin, indeed, google]
+    search_term: "banque privée"
+    location: "Lyon, France"
+    distance: 50
+    results_wanted: 25
+    hours_old: 24
+    country_indeed: france
+
+  - name: "D2 — Lyon private banking"
+    sites: [linkedin, indeed, google]
+    search_term: "private banking"
+    location: "Lyon, France"
+    distance: 50
+    results_wanted: 20
+    hours_old: 24
+    country_indeed: france
+
+  # --- AXE E : Lyon — Private Debt ---
+  - name: "E — Lyon private debt"
+    sites: [linkedin, indeed, google]
+    search_term: "private debt"
+    location: "Lyon, France"
+    distance: 50
+    results_wanted: 20
+    hours_old: 24
+    country_indeed: france
+
+  # --- AXE F : Lyon — Gestion d actifs (FR) ---
+  - name: "F — Lyon gestion d actifs"
+    sites: [linkedin, indeed, google]
+    search_term: "gestion d actifs"
     location: "Lyon, France"
     distance: 50
     results_wanted: 25
