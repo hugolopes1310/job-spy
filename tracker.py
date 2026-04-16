@@ -86,7 +86,8 @@ def _ingest_row(
         return 0
 
     title = (raw.get("title") or "").strip()
-    company = (raw.get("company") or "").strip()
+    company = str(raw.get("company") or "").strip()
+    if company.lower() == "nan": company = ""
     location = (raw.get("location") or "").strip()
     description = raw.get("description") or ""
     date_posted = str(raw.get("date_posted") or "")
@@ -101,7 +102,7 @@ def _ingest_row(
         oldest_id, oldest_first_seen, _cnt = fp_status
         try:
             first_dt = datetime.fromisoformat(oldest_first_seen)
-            gap_days = (datetime.utcnow() - first_dt).days
+            gap_days = (datetime.now(datetime.UTC) - first_dt).days
         except (ValueError, TypeError):
             gap_days = None
         if gap_days is not None and gap_days >= repost_gap_days:
@@ -134,7 +135,7 @@ def _ingest_row(
         "is_repost": is_repost,
         "repost_of": repost_of,
         "repost_gap_days": gap_days if is_repost else None,
-        "first_seen": datetime.utcnow().isoformat(),
+        "first_seen": datetime.now(datetime.UTC).isoformat(),
     }
     s, reasons = score_job(job, cfg.get("scoring", {}))
     job["score"] = s
