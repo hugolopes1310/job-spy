@@ -24,8 +24,118 @@ import yaml
 
 from db import DB_PATH, connect, get_state, init_db, save_feedback, set_state
 
+# Cover letter generation imports (lazy — only used when gen_cl callback arrives)
+_cl_deps_loaded = False
+_generate_cover_letter = None
+_write_cover_letters = None
+
+
+def _ensure_cl_deps():
+    global _cl_deps_loaded, _generate_cover_letter, _write_cover_letters
+    if _cl_deps_loaded:
+        return
+    try:
+        from cover_letter import generate_cover_letter
+        from cover_letter_docx import write_cover_letters
+        _generate_cover_letter = generate_cover_letter
+        _write_cover_letters = write_cover_letters
+    except ImportError as e:
+        print(f"[poller] CL deps not available: {e}")
+    _cl_deps_loaded = True
+
+
+def _fetch_job(conn, job_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT id, title, company, location, description, url FROM jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def _handle_gen_cl(conn, job_id: str, token: str, chat_id, message_id, cfg: dict) -> bool:
+    """Generate cover letters for a job and send links back via Telegram."""
+    _ensure_cl_deps()
+    if not _generate_cover_letter or not _write_cover_letters:
+        _send_reply(token, chat_id, "❌ Dépendances CL manquantes sur le runner.")
+        return False
+
+    job = _fetch_job(conn, job_id)
+    if not job:
+        _send_reply(token, chat_id, "❌ Offre introuvable dans la base.")
+        return False
+
+    print(f"[poller] Generating CL for: {job['title']} @ {job['company']}")
+    content = _generate_cover_letter(
+        title=job["title"] or "",
+        company=job["company"] or "",
+        location=job["location"] or "",
+        description=job["description"] or "",
+    )
+    if not content:
+        _send_reply(token, chat_id, "❌ Erreur lors de la génération de la CL.")
+        return False
+
+    cl_cfg = cfg.get("cover_letter", {}) or {}
+    cl_out_dir = Path(__file__).parent / cl_cfg.get("output_dir", "cover_letters")
+    cl_raw_base = (cl_cfg.get("github_raw_base") or "").rstrip("/")
+    sender = cl_cfg.get("sender", {})
+
+    try:
+        fr_path, en_path = _write_cover_letters(
+            output_dir=cl_out_dir,
+            job_id=job["id"],
+            title=job["title"] or "job",
+            company=job["company"] or "company",
+            location=job["location"] or "",
+            sender=sender,
+            content=content,
+        )
+    except Exception as e:
+        print(f"[poller] CL write failed: {e}")
+        _send_reply(token, chat_id, f"❌ Erreur écriture CL: {e}")
+        return False
+
+    # Build URLs
+    import urllib.parse as _up
+    cl_parts = []
+    if cl_raw_base:
+        rel_fr = f"{cl_out_dir.name}/{fr_path.name}"
+        rel_en = f"{cl_out_dir.name}/{en_path.name}"
+        cl_parts.append(f"[📝 CL FR]({cl_raw_base}/{_up.quote(rel_fr)})")
+        cl_parts.append(f"[📝 CL EN]({cl_raw_base}/{_up.quote(rel_en)})")
+
+    title_esc = (job["title"] or "?").replace("*", "").replace("_", "")
+    company_esc = (job["company"] or "?").replace("*", "").replace("_", "")
+    msg = f"📝 *Cover letters générées*\n{title_esc} @ {company_esc}\n"
+    if cl_parts:
+        msg += "  •  ".join(cl_parts)
+    else:
+        msg += f"Fichiers: {fr_path.name} / {en_path.name}"
+
+    _send_reply(token, chat_id, msg)
+    return True
+
+
+def _send_reply(token: str, chat_id, text: str):
+    """Send a simple Telegram message."""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    data = urllib.parse.urlencode(payload).encode()
+    try:
+        urllib.request.urlopen(url, data=data, timeout=10)
+    except Exception as e:
+        print(f"[poller] send_reply failed: {e}")
+
 OFFSET_KEY = "tg_update_offset"
 VALID_ACTIONS = {"good", "bad", "applied"}
+CL_ACTION = "gen_cl"
 
 
 def _env(cfg_section: dict, key: str) -> str | None:
@@ -98,7 +208,17 @@ def poll_once(cfg: dict) -> int:
                 saved_this = False
                 if ":" in data:
                     action, prefix = data.split(":", 1)
-                    if action in VALID_ACTIONS:
+                    if action == CL_ACTION:
+                        jid = _resolve_job_id(conn, prefix)
+                        if jid:
+                            cl_ok = _handle_gen_cl(conn, jid, token, chat_id, message_id, cfg)
+                            answer_text = "📝 CL en cours..." if cl_ok else "❌ Erreur CL"
+                            confirm_label = "📝 CL générée" if cl_ok else None
+                            saved_this = cl_ok
+                        else:
+                            answer_text = "❓ Offre introuvable"
+                            confirm_label = None
+                    elif action in VALID_ACTIONS:
                         jid = _resolve_job_id(conn, prefix)
                         if jid:
                             save_feedback(conn, jid, action)

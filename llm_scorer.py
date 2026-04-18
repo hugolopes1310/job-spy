@@ -41,25 +41,33 @@ Tu dois produire une analyse structurée EN FRANÇAIS, au format JSON strict :
 {{
   "score": <int 0-10>,                         // score global de fit
   "reason": "<1 phrase FR synthèse>",
-  "match_technique": <int 0-10>,               // match compétences/produits (structurés, dérivés, python…)
+  "match_finance": <int 0-10>,                 // match métier finance (produits structurés, dérivés, AM, PE, advisory, wealth, sales...)
   "match_geo": <int 0-10>,                     // Genève/Zurich/Lyon = 10 ; Paris/autre = bas ; remote = neutre
   "match_seniorite": <int 0-10>,               // 2 ans d'XP → 10 si junior-mid, 0 si senior/head of/MD
   "red_flags": ["<3 max, très courts>"],       // ex: "Rôle senior 10+ ans", "100% back-office"
   "atouts": ["<3 max, très courts>"],          // atouts à mettre en avant en entretien
   "salary": "<string ou null>",                // ex: "€80-110k" ou null si absent
-  "stack": ["<techno/produit>", ...],          // ex: ["Python", "Bloomberg", "Autocall"]
   "contact": "<string ou null>",               // ex: "John Smith, Head of Structuring" ou null
   "deadline": "<YYYY-MM-DD ou string ou null>",
-  "ats_keywords": ["<mots-clés>", ...],        // 5-10 mots-clés à faire apparaître dans le CV
   "apply_hint": "<string courte>"              // ex: "Apply via LinkedIn", "Via site carrière", "Easy Apply"
 }}
 
+IMPORTANT — PONDÉRATION DES CRITÈRES :
+Le score global doit refléter avant tout le FIT MÉTIER FINANCE, la GÉOGRAPHIE et la SÉNIORITÉ.
+Les compétences tech (Python, VBA, IA, LLM, etc.) sont un BONUS qui peut ajouter +1 au score,
+mais ne doivent JAMAIS être le critère principal. Un poste 100% tech/développeur sans dimension
+finance doit scorer 0-2 même s'il mentionne Python ou IA.
+
+Le candidat cherche un poste EN FINANCE (structuration, sales, advisory, AM, PE, private debt,
+banque privée, wealth management, fintech à dimension finance). Son profil tech est un plus,
+pas sa spécialité.
+
 Barème score global :
-- 9-10 : match parfait (structureur dérivés Genève/Zurich, cross-asset solutions Suisse)
-- 7-8 : très pertinent (advisory/investment solutions, AM obligataire, PE mid-cap Lyon, fintech Lyon avec finance)
+- 9-10 : match parfait (structureur dérivés Genève/Zurich, cross-asset solutions Suisse, SP sales)
+- 7-8 : très pertinent (advisory/investment solutions, AM, PE mid-cap Lyon, banque privée Lyon/Suisse, fintech Lyon avec dimension finance)
 - 5-6 : intéressant mais un axe faible (geo ou seniorité ou produit décalé)
-- 3-4 : lien ténu
-- 0-2 : middle/back office, tech pur sans finance, rôle fiscal/juridique, assurance, courtier
+- 3-4 : lien ténu (rôle finance mais mauvaise géo, ou bonne géo mais rôle éloigné)
+- 0-2 : middle/back office, tech pur sans finance, rôle fiscal/juridique, assurance, courtier, développeur logiciel
 
 Les listes peuvent être vides ([]) si rien de notable. Les champs null si info absente. Ne rien inventer.
 """
@@ -92,9 +100,13 @@ def _build_feedback_context(limit_each: int = 5) -> str:
     for row in bad:
         parts.append(f"  👎 BAD (à ne PAS recommander) : « {row['title']} » @ {row['company']} ({row['location']}) — axe={row['axe']}")
     parts.append(
-        "Si l'offre ressemble à un pattern BAD (titre/société/axe proches), "
-        "baisse le score. Si elle ressemble à un pattern GOOD/APPLIED, "
-        "n'hésite pas à monter le score."
+        "\nCES RETOURS SONT CRITIQUES — ils reflètent les préférences RÉELLES du candidat :"
+        "\n- Si l'offre ressemble à un pattern BAD (titre/secteur/type de rôle proches), "
+        "baisse le score d'au moins 3 points."
+        "\n- Si elle ressemble à un pattern GOOD/APPLIED (même type de rôle, même secteur, "
+        "même type d'entreprise), monte le score d'au moins 2 points."
+        "\n- Priorise ces signaux par-dessus le barème théorique : le candidat sait mieux "
+        "que toi ce qui l'intéresse."
     )
     return "\n".join(parts)
 
@@ -142,9 +154,9 @@ def analyze_offer(title: str, company: str, location: str, description: str) -> 
             # Ensure required keys + types
             result.setdefault("score", 0)
             result.setdefault("reason", "")
-            for k in ("match_technique", "match_geo", "match_seniorite"):
+            for k in ("match_finance", "match_geo", "match_seniorite"):
                 result.setdefault(k, -1)
-            for k in ("red_flags", "atouts", "stack", "ats_keywords"):
+            for k in ("red_flags", "atouts"):
                 v = result.get(k)
                 if not isinstance(v, list):
                     result[k] = []

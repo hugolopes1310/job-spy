@@ -55,14 +55,19 @@ def send_telegram(
 
 
 def feedback_keyboard(job_id: str) -> dict:
-    """Inline keyboard with 👍 / 👎 / ✅ Applied — callback_data carries the job id short prefix."""
+    """Inline keyboard with 👍 / 👎 / ✅ Applied / 📝 CL — callback_data carries the job id short prefix."""
     jid = job_id[:16]  # Telegram callback_data limited to 64 bytes, prefix is enough
     return {
-        "inline_keyboard": [[
-            {"text": "👍 Good", "callback_data": f"good:{jid}"},
-            {"text": "👎 Bad", "callback_data": f"bad:{jid}"},
-            {"text": "✅ Applied", "callback_data": f"applied:{jid}"},
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "👍 Good", "callback_data": f"good:{jid}"},
+                {"text": "👎 Bad", "callback_data": f"bad:{jid}"},
+                {"text": "✅ Applied", "callback_data": f"applied:{jid}"},
+            ],
+            [
+                {"text": "📝 Générer CL", "callback_data": f"gen_cl:{jid}"},
+            ],
+        ]
     }
 
 
@@ -111,7 +116,7 @@ def format_job_message(
     if analysis:
         sub = []
         for key, label in [
-            ("match_technique", "tech"),
+            ("match_finance", "finance"),
             ("match_geo", "geo"),
             ("match_seniorite", "sen"),
         ]:
@@ -138,12 +143,6 @@ def format_job_message(
         if facts:
             lines.append(" · ".join(facts))
 
-        stack = analysis.get("stack") or []
-        if stack:
-            lines.append(f"🧰 {esc(' · '.join(stack[:6]))}")
-        ats = analysis.get("ats_keywords") or []
-        if ats:
-            lines.append(f"🏷️ ATS: {esc(', '.join(ats[:8]))}")
         if analysis.get("apply_hint"):
             lines.append(f"➡️ {esc(analysis['apply_hint'])}")
 
