@@ -1,0 +1,38 @@
+name: Telegram Feedback Poll
+
+on:
+  schedule:
+    # Every 5 minutes, 6am-10pm UTC (active hours)
+    - cron: '*/5 6-22 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: feedback-poll
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Poll Telegram feedback
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python feedback_poller.py
+      - name: Commit if changed
+        run: |
+          git config user.name "Job Tracker Bot"
+          git config user.email "bot@noreply.github.com"
+          git add jobs.db cover_letters/ || true
+          git diff --cached --quiet || git commit -m "Update feedback + cover letters [skip ci]"
+          git push
