@@ -2,3 +2,10 @@ python-jobspy>=1.1.70
 pyyaml>=6.0
 flask>=3.0
 python-docx>=1.1.2
+
+# --- multi-user app/ (Phase 1: local Streamlit onboarding) ---
+streamlit>=1.36
+pypdf>=4.0
+
+# --- multi-user app/ (Phase 2: Supabase backend + deployment) ---
+supabase>=2.5

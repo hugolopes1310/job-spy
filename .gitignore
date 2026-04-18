@@ -2,3 +2,9 @@ tracker.log
 .venv/
 __pycache__/
 *.pyc
+
+# multi-user app — user data (never commit)
+app/data/users/*/
+!app/data/users/.gitkeep
+.streamlit/secrets.toml
+.DS_Store
