@@ -9,3 +9,6 @@ pypdf>=4.0
 
 # --- multi-user app/ (Phase 2: Supabase backend + deployment) ---
 supabase>=2.5
+
+# Cookie-based session persistence so F5 doesn't log users out.
+extra-streamlit-components>=0.1.71
