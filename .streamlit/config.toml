@@ -1,0 +1,23 @@
+# =====================================================================
+# Kairo — Streamlit theme
+# =====================================================================
+# Streamlit n'expose que quelques tokens — on pousse le reste via CSS
+# injecté dans app/lib/theme.py (fonts, cartes, gradients, boutons…).
+
+[theme]
+primaryColor = "#667eea"                   # indigo-violet Kairo
+backgroundColor = "#FAFAFB"                # base blanche à peine teintée
+secondaryBackgroundColor = "#FFFFFF"       # cartes / inputs / sidebar
+textColor = "#0F172A"                      # slate-900
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+fileWatcherType = "auto"
+
+[client]
+showErrorDetails = true
+toolbarMode = "minimal"

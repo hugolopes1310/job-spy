@@ -21,12 +21,19 @@ from typing import Any
 
 import streamlit as st
 
+from app.lib.klog import log
 from app.lib.session_cookies import (
     clear_refresh_token,
     load_refresh_token,
     save_refresh_token,
 )
 from app.lib.supabase_client import get_anon_client, get_service_client
+
+
+# Session-state key used to carry an auth-expiry banner from the moment the
+# refresh fails to the next page render (i.e. the login screen). Read once
+# by the login page, then cleared.
+SESSION_EXPIRED_KEY = "auth_session_expired_msg"
 
 # Minimum enforced length for user-chosen passwords (matches Supabase default).
 MIN_PASSWORD_LENGTH = 8
@@ -121,6 +128,10 @@ def get_current_user() -> CurrentUser | None:
 
     If `st.session_state` is empty (e.g. right after a hard refresh), we try
     to rehydrate from the refresh_token stored in a browser cookie.
+
+    If the token has expired AND the refresh fails, we set a one-shot session
+    flag so the login screen can show "ta session a expiré" instead of just
+    silently kicking the user.
     """
     token = st.session_state.get("sb_access_token")
     if not token:
@@ -134,6 +145,11 @@ def get_current_user() -> CurrentUser | None:
     # Refresh if the token expires in <60s.
     if expires_at and expires_at - 60 < time.time():
         if not _try_refresh():
+            log("auth.session_expired", level="info",
+                user_id=st.session_state.get("sb_user_id"))
+            st.session_state[SESSION_EXPIRED_KEY] = (
+                "Ta session a expiré. Reconnecte-toi pour continuer."
+            )
             logout()
             return None
         token = st.session_state["sb_access_token"]
@@ -143,6 +159,15 @@ def get_current_user() -> CurrentUser | None:
     if not (user_id and email and token):
         return None
     return CurrentUser(user_id=user_id, email=email, access_token=token)
+
+
+def consume_session_expired_message() -> str | None:
+    """Pop the one-shot "session expired" message, if any.
+
+    Login pages call this and render the returned string as an info banner.
+    Subsequent calls return None (banner is not sticky).
+    """
+    return st.session_state.pop(SESSION_EXPIRED_KEY, None)
 
 
 def _apply_session(sess: Any, user: Any | None = None) -> None:

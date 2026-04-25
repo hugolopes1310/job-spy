@@ -2,6 +2,10 @@
 
 Intentionally simple: we trust the LLM downstream to understand structure,
 so we just need clean-enough text (no section detection, no NER).
+
+Error model — every distinct failure mode raises a specific subclass of
+:class:`CVParseError` so the UI can show a friendly, actionable message
+instead of a stack trace.
 """
 from __future__ import annotations
 
@@ -10,8 +14,48 @@ import re
 from pathlib import Path
 
 
-class UnsupportedFormatError(ValueError):
+# ---------------------------------------------------------------------------
+# Error hierarchy
+# ---------------------------------------------------------------------------
+class CVParseError(ValueError):
+    """Base class — parsing failed for a known reason. UI-safe message."""
+
+
+class UnsupportedFormatError(CVParseError):
     """Raised when the uploaded file extension is not .pdf / .docx / .txt."""
+
+
+class FileTooLargeError(CVParseError):
+    """Uploaded file is larger than the safety cap."""
+
+
+class EmptyFileError(CVParseError):
+    """Zero-byte upload."""
+
+
+class CorruptedFileError(CVParseError):
+    """File extension is supported but the binary blob is malformed."""
+
+
+class EncryptedPDFError(CVParseError):
+    """Password-protected PDF — pypdf can open it but extract_text yields nothing."""
+
+
+class ImageOnlyPDFError(CVParseError):
+    """PDF that contains only images / scans — no extractable text."""
+
+
+class CVParseConfigError(RuntimeError):
+    """Missing dependency (pypdf / python-docx). Surfaces as a config error,
+    not a CV parse error, because it's a deploy-time issue, not user input."""
+
+
+# ---------------------------------------------------------------------------
+# Limits — keep them generous but bounded.
+# ---------------------------------------------------------------------------
+MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MiB
+# Below this, we suspect an image-only PDF or a scan with bad OCR.
+MIN_TEXT_CHARS_FOR_PDF = 80
 
 
 def _clean(text: str) -> str:
@@ -31,15 +75,41 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
+# ---------------------------------------------------------------------------
+# PDF
+# ---------------------------------------------------------------------------
 def _parse_pdf(file_bytes: bytes) -> str:
     try:
         from pypdf import PdfReader
+        from pypdf.errors import PdfReadError  # type: ignore[import]
     except ImportError as e:
-        raise RuntimeError(
-            "pypdf missing — run `pip install pypdf` (it's in requirements.txt)"
+        raise CVParseConfigError(
+            "pypdf manquant — `pip install pypdf` (déjà dans requirements.txt)"
         ) from e
 
-    reader = PdfReader(io.BytesIO(file_bytes))
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+    except PdfReadError as e:
+        raise CorruptedFileError(
+            "PDF illisible (fichier corrompu ou tronqué). Réessaie avec un autre PDF."
+        ) from e
+    except Exception as e:  # noqa: BLE001
+        raise CorruptedFileError(
+            f"Impossible d'ouvrir le PDF : {type(e).__name__}."
+        ) from e
+
+    # Encrypted PDFs may "open" but yield no text — try to detect both cases.
+    if getattr(reader, "is_encrypted", False):
+        # Best-effort: try empty-password decrypt before giving up.
+        try:
+            ok = reader.decrypt("")
+        except Exception:  # noqa: BLE001
+            ok = 0
+        if not ok:
+            raise EncryptedPDFError(
+                "Ce PDF est protégé par mot de passe. Enlève la protection puis réessaie."
+            )
+
     parts: list[str] = []
     for page in reader.pages:
         try:
@@ -47,18 +117,43 @@ def _parse_pdf(file_bytes: bytes) -> str:
         except Exception:  # noqa: BLE001
             # Don't crash on one bad page — skip it.
             continue
-    return "\n\n".join(parts)
+    text = "\n\n".join(parts)
+    # If the text content is suspiciously short, we likely have an image-only
+    # PDF (scan, photo). Tell the user what to do instead of returning garbage.
+    if len(text.strip()) < MIN_TEXT_CHARS_FOR_PDF:
+        raise ImageOnlyPDFError(
+            "Ce PDF semble être une image scannée (texte non extractible). "
+            "Fournis plutôt un PDF avec du texte sélectionnable, ou un .docx."
+        )
+    return text
 
 
+# ---------------------------------------------------------------------------
+# DOCX
+# ---------------------------------------------------------------------------
 def _parse_docx(file_bytes: bytes) -> str:
     try:
         from docx import Document
+        from docx.opc.exceptions import PackageNotFoundError  # type: ignore[import]
     except ImportError as e:
-        raise RuntimeError(
-            "python-docx missing — run `pip install python-docx`"
+        raise CVParseConfigError(
+            "python-docx manquant — `pip install python-docx`"
         ) from e
 
-    doc = Document(io.BytesIO(file_bytes))
+    try:
+        doc = Document(io.BytesIO(file_bytes))
+    except PackageNotFoundError as e:
+        # Most common: user uploaded a .doc (binary old Word) renamed to .docx,
+        # or the file is corrupted.
+        raise CorruptedFileError(
+            "DOCX illisible. Vérifie que le fichier n'est pas un ancien .doc renommé "
+            "et qu'il n'est pas corrompu."
+        ) from e
+    except Exception as e:  # noqa: BLE001
+        raise CorruptedFileError(
+            f"Impossible d'ouvrir le DOCX : {type(e).__name__}."
+        ) from e
+
     parts: list[str] = []
     for para in doc.paragraphs:
         if para.text:
@@ -72,6 +167,9 @@ def _parse_docx(file_bytes: bytes) -> str:
     return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def parse_cv(file_bytes: bytes, filename: str) -> str:
     """Extract plain text from an uploaded CV / cover letter.
 
@@ -83,19 +181,41 @@ def parse_cv(file_bytes: bytes, filename: str) -> str:
         Cleaned plain text.
 
     Raises:
-        UnsupportedFormatError: If the extension isn't .pdf / .docx / .txt.
+        UnsupportedFormatError: Extension isn't .pdf / .docx / .txt / .md.
+        EmptyFileError:         Zero-byte upload.
+        FileTooLargeError:      File exceeds MAX_FILE_BYTES.
+        CorruptedFileError:     Header looks valid but content is unreadable.
+        EncryptedPDFError:      PDF needs a password.
+        ImageOnlyPDFError:      PDF has no extractable text (scan / image-only).
+        CVParseConfigError:     Required parsing library is not installed.
     """
+    if not file_bytes:
+        raise EmptyFileError("Fichier vide. Vérifie que ton CV n'est pas en cours de synchronisation.")
+    if len(file_bytes) > MAX_FILE_BYTES:
+        raise FileTooLargeError(
+            f"Fichier trop volumineux ({len(file_bytes) / 1_048_576:.1f} Mo). "
+            f"Taille max : {MAX_FILE_BYTES // 1_048_576} Mo."
+        )
+
     ext = Path(filename).suffix.lower().lstrip(".")
     if ext == "pdf":
         raw = _parse_pdf(file_bytes)
     elif ext in ("docx", "doc"):
-        # .doc (binary old Word) isn't supported by python-docx; best-effort.
+        if ext == "doc":
+            # python-docx can't open binary .doc — fail fast with a clear msg
+            # rather than the generic PackageNotFoundError.
+            raise UnsupportedFormatError(
+                "Format .doc (ancien Word) non supporté. Convertis-le en .docx avant l'upload."
+            )
         raw = _parse_docx(file_bytes)
     elif ext in ("txt", "md"):
-        raw = file_bytes.decode("utf-8", errors="replace")
+        try:
+            raw = file_bytes.decode("utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001
+            raise CorruptedFileError(f"Impossible de lire le fichier texte : {e}") from e
     else:
         raise UnsupportedFormatError(
-            f"Format .{ext} non supporté. Formats acceptés : PDF, DOCX, TXT."
+            f"Format .{ext} non supporté. Formats acceptés : PDF, DOCX, TXT, MD."
         )
     return _clean(raw)
 

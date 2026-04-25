@@ -181,6 +181,60 @@ def load_user_config(user_id: str, *, use_service: bool = False) -> dict[str, An
     return data[0]["config"] if data else None
 
 
+def update_custom_source_status(
+    user_id: str,
+    url: str,
+    *,
+    status: str,
+    last_error: str | None = None,
+    error_count_delta: int = 0,
+) -> None:
+    """Patch one entry in `config.custom_career_sources` after a scrape attempt.
+
+    `status` is typically "ok" | "not_scrapable" | "pending".
+    Always uses service_role — only the scraper calls this.
+    """
+    svc = get_service_client()
+    res = (
+        svc.table("user_configs")
+        .select("config")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return
+    cfg = rows[0].get("config") or {}
+    sources = cfg.get("custom_career_sources") or []
+    if not isinstance(sources, list):
+        return
+    changed = False
+    target_url = (url or "").strip().rstrip("/").lower()
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        s_url = (src.get("url") or "").strip().rstrip("/").lower()
+        if s_url == target_url:
+            src["status"] = status
+            if status == "ok":
+                src["last_success_at"] = _now()
+                src["last_error"] = ""
+                src["error_count"] = 0
+            else:
+                src["last_failure_at"] = _now()
+                if last_error is not None:
+                    src["last_error"] = last_error[:500]
+                if error_count_delta:
+                    src["error_count"] = int(src.get("error_count") or 0) + error_count_delta
+            changed = True
+            break
+    if not changed:
+        return
+    cfg["custom_career_sources"] = sources
+    svc.table("user_configs").update({"config": cfg}).eq("user_id", user_id).execute()
+
+
 def save_cv_text(user_id: str, text: str) -> None:
     """Update cv_text on an existing user_configs row.
 
@@ -232,6 +286,85 @@ def load_cover_letter_text(user_id: str, *, use_service: bool = False) -> str:
     )
     data = res.data or []
     return data[0].get("cover_letter_text") or "" if data else ""
+
+
+# ---------------------------------------------------------------------------
+# Cover letter DOCX template — binary storage so we can clone the user's
+# own layout when generating per-offer cover letters.
+# ---------------------------------------------------------------------------
+def save_cover_letter_docx(user_id: str, docx_bytes: bytes, filename: str) -> None:
+    """Persist the uploaded .docx template.
+
+    PostgREST transports BYTEA as a base64-encoded string with a `\\x` hex
+    prefix (Supabase/PostgREST convention). We send the raw bytes via the
+    service client's binary helper is not available in the Python SDK, so we
+    go through a `rpc` flavored insert: actually, supabase-py 2.x forwards any
+    value as JSON. The simplest portable path is to encode to base64 and let
+    Postgres decode on the fly using `decode(..., 'base64')` — but
+    ALTER TABLE already declared BYTEA, so PostgREST will accept either:
+      - A `\\x<hex>` string (Postgres hex format)
+      - A raw base64 string with the `base64:` prefix (supabase-specific)
+    We use the hex form to keep the payload predictable and round-trippable.
+    """
+    if not docx_bytes:
+        return
+    hex_blob = "\\x" + docx_bytes.hex()
+    (
+        _client(use_service=False)
+        .table("user_configs")
+        .update(
+            {
+                "cover_letter_docx": hex_blob,
+                "cover_letter_filename": filename or "template.docx",
+            }
+        )
+        .eq("user_id", user_id)
+        .execute()
+    )
+
+
+def load_cover_letter_docx(
+    user_id: str, *, use_service: bool = False
+) -> tuple[bytes, str] | None:
+    """Return (bytes, filename) for the user's template, or None if absent."""
+    res = (
+        _client(use_service)
+        .table("user_configs")
+        .select("cover_letter_docx, cover_letter_filename")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    data = res.data or []
+    if not data:
+        return None
+    raw = data[0].get("cover_letter_docx")
+    if not raw:
+        return None
+    # PostgREST returns BYTEA as a string: either "\x<hex>" (Postgres hex) or
+    # a base64-encoded string (depending on the server's output format). We
+    # handle both to stay robust across Supabase versions.
+    try:
+        if raw.startswith("\\x"):
+            blob = bytes.fromhex(raw[2:])
+        else:
+            import base64
+            blob = base64.b64decode(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    filename = data[0].get("cover_letter_filename") or "template.docx"
+    return blob, filename
+
+
+def clear_cover_letter_docx(user_id: str) -> None:
+    """Remove the stored template (used when the user wants to start over)."""
+    (
+        _client(use_service=False)
+        .table("user_configs")
+        .update({"cover_letter_docx": None, "cover_letter_filename": None})
+        .eq("user_id", user_id)
+        .execute()
+    )
 
 
 # ---------------------------------------------------------------------------

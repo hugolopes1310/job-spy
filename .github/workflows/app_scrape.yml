@@ -1,0 +1,81 @@
+name: Job Spy Scraper (Phase 3)
+
+# Runs the multi-user scraper every hour during waking hours (UTC).
+# UTC 4-20 ≈ CET 5h-21h winter / 6h-22h summer.
+# Public repos have unlimited GitHub Actions minutes, so we can afford this.
+
+on:
+  schedule:
+    - cron: '0 4-20 * * *'
+  workflow_dispatch:
+    inputs:
+      user:
+        description: 'Limit to one user email (optional)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run (no DB writes)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: job-spy-scrape
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.user }}" ]; then
+            ARGS="--user ${{ inputs.user }}"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python -m app.scraper.run $ARGS
+
+  cleanup:
+    # Once a day at 03:00 UTC, drop jobs not seen for 60+ days.
+    # Cascade deletes matches via FK. Keeps the DB small & the dashboard snappy.
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 4-20 * * *' && github.run_attempt == 1
+    needs: [scrape]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Cleanup
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python -c "from app.lib.jobs_store import cleanup_stale_jobs; print('deleted', cleanup_stale_jobs(60))"

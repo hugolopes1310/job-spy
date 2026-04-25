@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 
 from app.lib.auth import (  # noqa: E402
     MIN_PASSWORD_LENGTH,
+    consume_session_expired_message,
     email_has_password,
     get_current_user,
     logout,
@@ -87,6 +88,9 @@ def _goto(step: str, **extra: Any) -> None:
 
 def _login_step_login() -> None:
     """Classic sign-in : email + password on the same screen."""
+    expired_msg = consume_session_expired_message()
+    if expired_msg:
+        st.info(expired_msg, icon=":material/schedule:")
     st.markdown(
         "<div class='kairo-login-head'>"
         "<h3>Connexion</h3>"
@@ -481,65 +485,13 @@ def _approved_landing(profile: dict, user_id: str) -> None:
     is_admin   = bool(profile.get("is_admin"))
     config     = load_user_config(user_id)
 
-    # ---- 2) Pas de config → onboarding CTA en hero ---------------------------
+    # ---- 2) Pas de config → redirection directe vers l'onboarding -----------
+    #   Plus de landing CTA intermédiaire : dès qu'un user vient de se créer
+    #   un compte + mot de passe, on l'envoie direct dans le wizard de
+    #   configuration. Streamlit's st.switch_page fait un rerun propre vers
+    #   la page demandée.
     if config is None:
-        st.markdown(
-            f"""
-<div style="margin-bottom:1.4rem;">
-  <h2 style="margin:0 0 0.3rem 0;">Bienvenue {first_name}.</h2>
-  <p style="color:#64748B;margin:0;font-size:0.98rem;">
-    Configure ta recherche pour recevoir tes premières offres scorées par l'IA.
-  </p>
-</div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            """
-<div style="
-  border-radius:18px;
-  background:linear-gradient(135deg,rgba(102,126,234,0.10) 0%,rgba(118,75,162,0.10) 100%);
-  border:1px solid rgba(102,126,234,0.20);
-  padding:2rem 1.8rem;
-  margin-bottom:1rem;
-">
-  <div style="font-size:0.78rem;font-weight:600;letter-spacing:0.10em;
-              text-transform:uppercase;color:#667eea;margin-bottom:0.6rem;">
-    Étape 1 / 1
-  </div>
-  <h3 style="margin:0 0 0.5rem 0;font-size:1.4rem;">
-    Configure ta recherche en quelques minutes
-  </h3>
-  <p style="color:#475569;margin:0 0 1.2rem 0;font-size:0.96rem;line-height:1.55;">
-    Importe ton CV, décris le poste que tu vises, ajoute tes contraintes
-    (localisation, salaire, secteurs à éviter). Kairo scrape les offres
-    pertinentes chaque jour et te les classe par adéquation.
-  </p>
-  <div style="display:flex;gap:1.2rem;color:#64748B;font-size:0.88rem;margin-top:0.8rem;">
-    <div>· CV PDF ou DOCX</div>
-    <div>· ~5 minutes</div>
-    <div>· Modifiable à tout moment</div>
-  </div>
-</div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.page_link(
-            "pages/1_onboarding.py",
-            label="Démarrer la configuration",
-            icon=":material/arrow_forward:",
-        )
-        if is_admin:
-            st.markdown(
-                '<div style="margin-top:2.5rem;text-align:center;">',
-                unsafe_allow_html=True,
-            )
-            st.page_link(
-                "pages/99_admin.py",
-                label="Panneau admin",
-                icon=":material/shield:",
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
+        st.switch_page("pages/1_onboarding.py")
         return
 
     # ---- 3) Config présente → vrai dashboard avec KPIs -----------------------

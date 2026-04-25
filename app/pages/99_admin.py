@@ -14,28 +14,11 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.lib.auth import get_current_user  # noqa: E402
+from app.lib.page_setup import setup_authed_page  # noqa: E402
 from app.lib.storage import (  # noqa: E402
-    get_profile_by_id,
     list_profiles,
     update_status,
 )
-
-st.set_page_config(page_title="Admin — Job Spy", page_icon="🛡", layout="wide")
-
-
-def _guard() -> dict:
-    user = get_current_user()
-    if not user:
-        st.error("Connecte-toi d'abord.")
-        st.page_link("streamlit_app.py", label="← Accueil")
-        st.stop()
-    profile = get_profile_by_id(user.user_id)
-    if not profile or not profile.get("is_admin"):
-        st.error("🚫 Accès refusé — réservé aux admins.")
-        st.page_link("streamlit_app.py", label="← Accueil")
-        st.stop()
-    return profile
 
 
 def _render_section(title: str, profiles: list[dict], actions: list[tuple[str, str, str]]) -> None:
@@ -67,8 +50,14 @@ def _render_section(title: str, profiles: list[dict], actions: list[tuple[str, s
 
 
 def main() -> None:
-    _guard()
-    st.markdown("## 🛡 Panneau admin")
+    setup_authed_page(
+        page_title="Administration",
+        page_icon=":material/shield_person:",
+        layout="wide",
+        require_admin=True,
+    )
+
+    st.markdown("## Panneau admin")
     st.caption("Approuve ou retire l'accès aux utilisateurs.")
 
     pending = list_profiles(status="pending", use_service=True)
@@ -77,9 +66,9 @@ def main() -> None:
 
     tab1, tab2, tab3 = st.tabs(
         [
-            f"⏳ En attente ({len(pending)})",
-            f"✅ Approuvés ({len(approved)})",
-            f"🚫 Révoqués ({len(revoked)})",
+            f"En attente ({len(pending)})",
+            f"Approuvés ({len(approved)})",
+            f"Révoqués ({len(revoked)})",
         ]
     )
 
@@ -88,8 +77,8 @@ def main() -> None:
             "Demandes d'accès en attente",
             pending,
             actions=[
-                ("✅ Approuver", "approved", "primary"),
-                ("🚫 Rejeter", "revoked", "secondary"),
+                ("Approuver", "approved", "primary"),
+                ("Rejeter", "revoked", "secondary"),
             ],
         )
 
@@ -97,16 +86,18 @@ def main() -> None:
         _render_section(
             "Utilisateurs actifs",
             approved,
-            actions=[("🚫 Révoquer l'accès", "revoked", "secondary")],
+            actions=[("Révoquer l'accès", "revoked", "secondary")],
         )
 
     with tab3:
         _render_section(
             "Utilisateurs révoqués",
             revoked,
-            actions=[("♻️ Re-approuver", "approved", "primary")],
+            actions=[("Re-approuver", "approved", "primary")],
         )
 
 
 if __name__ == "__main__":
+    main()
+else:
     main()

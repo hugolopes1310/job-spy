@@ -1,0 +1,85 @@
+name: Tests
+
+# Runs the lightweight smoke / unit tests on every push and PR.
+# Each test file is a self-contained `python <file>` driver — no pytest
+# needed. We discover them by glob so adding a new test file requires no
+# CI change.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keep at most one CI run per branch; a new push cancels the older run.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install runtime + parsing dependencies
+        # The test files stub out streamlit + supabase, but cv_parser and
+        # logging tests need the real pypdf / python-docx wheels.
+        run: |
+          python -m pip install --upgrade pip
+          # Best-effort: install the full requirements.txt so tests run in a
+          # production-like env. If something breaks, fall back to the strict
+          # subset that the test files actually exercise.
+          if ! pip install -r requirements.txt; then
+            echo "::warning ::full requirements.txt failed — installing minimal subset"
+            pip install pypdf python-docx
+          fi
+
+      - name: Discover test files
+        id: discover
+        run: |
+          # Anything matching app/**/test_*.py is a test driver.
+          mapfile -t FILES < <(find app -type f -name 'test_*.py' | sort)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "::error ::no test files found"
+            exit 1
+          fi
+          printf '%s\n' "${FILES[@]}"
+          # Stash for the next step.
+          {
+            echo "files<<EOF"
+            printf '%s\n' "${FILES[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run all test drivers
+        env:
+          PYTHONPATH: .
+          # Test files also use these stub-friendly defaults.
+          LOG_LEVEL: warn
+        run: |
+          set -e
+          fail=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            echo
+            echo "=========================================="
+            echo "  RUN  $f"
+            echo "=========================================="
+            if ! python "$f"; then
+              echo "::error file=$f::test driver failed"
+              fail=1
+            fi
+          done <<< "${{ steps.discover.outputs.files }}"
+          exit $fail
