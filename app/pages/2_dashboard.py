@@ -451,7 +451,7 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
             st.page_link(
-                "pages/1_onboarding.py",
+                "pages/1_mon_profil.py",
                 label="Démarrer la configuration",
                 icon=":material/arrow_forward:",
             )
@@ -535,9 +535,9 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
             st.page_link(
-                "pages/1_onboarding.py",
-                label="Ajuster ma configuration",
-                icon=":material/tune:",
+                "pages/1_mon_profil.py",
+                label="Ajuster mon profil",
+                icon=":material/badge:",
             )
         return
 

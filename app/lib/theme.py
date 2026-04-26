@@ -512,7 +512,7 @@ def render_sidebar(
     Items shown :
         - Accueil           pages "/"
         - Mes offres        pages/2_dashboard.py
-        - Configuration     pages/1_onboarding.py
+        - Mon profil        pages/1_mon_profil.py
         - Panneau admin     pages/99_admin.py   (admin only)
         - Footer            avatar + email + bouton Sortir
     """
@@ -557,8 +557,8 @@ def render_sidebar(
                      icon=":material/dashboard:")
         st.page_link("pages/3_suivi.py", label="Suivi",
                      icon=":material/track_changes:")
-        st.page_link("pages/1_onboarding.py", label="Configuration",
-                     icon=":material/tune:")
+        st.page_link("pages/1_mon_profil.py", label="Mon profil",
+                     icon=":material/badge:")
 
         if is_admin:
             st.markdown(

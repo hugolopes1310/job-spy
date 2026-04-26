@@ -485,13 +485,12 @@ def _approved_landing(profile: dict, user_id: str) -> None:
     is_admin   = bool(profile.get("is_admin"))
     config     = load_user_config(user_id)
 
-    # ---- 2) Pas de config → redirection directe vers l'onboarding -----------
-    #   Plus de landing CTA intermédiaire : dès qu'un user vient de se créer
-    #   un compte + mot de passe, on l'envoie direct dans le wizard de
-    #   configuration. Streamlit's st.switch_page fait un rerun propre vers
-    #   la page demandée.
+    # ---- 2) Pas de config → redirection directe vers Mon profil -------------
+    #   Phase 4 : la page de profil tourne autour de la synthèse LLM. Un user
+    #   sans config tombe sur l'empty-state CV upload de `1_mon_profil.py`,
+    #   plus de wizard à 3 étapes.
     if config is None:
-        st.switch_page("pages/1_onboarding.py")
+        st.switch_page("pages/1_mon_profil.py")
         return
 
     # ---- 3) Config présente → vrai dashboard avec KPIs -----------------------
@@ -578,19 +577,19 @@ def _approved_landing(profile: dict, user_id: str) -> None:
                 """
 <div style="padding:0.2rem 0;">
   <div style="font-weight:600;color:#0F172A;margin-bottom:0.2rem;">
-    Ma configuration
+    Mon profil
   </div>
   <div style="color:#64748B;font-size:0.86rem;line-height:1.5;margin-bottom:0.6rem;">
-    CV, secteurs, localisation, signaux d'alerte.
+    Synthèse IA — rôles, géo, deal-breakers, dream companies.
   </div>
 </div>
                 """,
                 unsafe_allow_html=True,
             )
             st.page_link(
-                "pages/1_onboarding.py",
-                label="Modifier ma recherche",
-                icon=":material/tune:",
+                "pages/1_mon_profil.py",
+                label="Voir mon profil",
+                icon=":material/badge:",
             )
         with st.container(border=True):
             st.markdown(
