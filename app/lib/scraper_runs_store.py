@@ -28,9 +28,46 @@ from app.lib.supabase_client import get_service_client
 # hit this — at that point a stack trace per user blows up the JSONB anyway.
 _MAX_ERRORS_PER_RUN = 50
 
+# Any `running` row older than this is presumed dead (the GHA workflow killed
+# it via cancel-in-progress, the Streamlit session died mid-spinner, the dyno
+# crashed, …). A healthy run never crosses ~10 min ; 30 leaves comfortable
+# headroom while keeping the admin panel free of zombie rows.
+_STALE_RUNNING_MINUTES = 30
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _sweep_stale_running_runs() -> None:
+    """Mark `running` rows older than _STALE_RUNNING_MINUTES as 'failed'.
+
+    Called from start_run() on every new pass — the cheapest place to catch
+    zombies (no extra cron job needed). Failures are swallowed : a sweep that
+    doesn't run is harmless, but raising here would block real telemetry.
+
+    The cutoff is computed in Python (not SQL `now()`) so we never need to
+    worry about Supabase clock skew vs. the runner.
+    """
+    try:
+        from datetime import timedelta  # local — keeps the module hot path lean
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=_STALE_RUNNING_MINUTES)
+        ).isoformat()
+        # We can't append to the JSONB array via the REST API in one round-trip,
+        # so we just flip the status + finished_at + a generic note. The errors
+        # column stays as whatever was there at start_run time (typically []).
+        get_service_client().table("scraper_runs").update(
+            {
+                "status": "failed",
+                "finished_at": _now_iso(),
+                "notes": "auto-marked failed: stale running row (see _sweep_stale_running_runs)",
+            }
+        ).eq("status", "running").lt("started_at", cutoff).execute()
+    except Exception as e:  # noqa: BLE001
+        log("scraper_runs.sweep_failed", level="warn",
+            error=f"{type(e).__name__}: {e}")
 
 
 def start_run(
@@ -52,6 +89,12 @@ def start_run(
     if runner not in ("cron", "manual", "cli"):
         log("scraper_runs.bad_runner", level="warn", runner=runner)
         runner = "cli"  # fallback rather than crash
+
+    # Sweep zombies before opening a fresh row. We do it here (not in finish)
+    # because finish only fires on healthy completion — exactly the path we
+    # don't need to clean. Stale rows show up when a previous run was KILLED.
+    _sweep_stale_running_runs()
+
     payload: dict[str, Any] = {
         "runner": runner,
         "status": "running",
@@ -158,6 +201,46 @@ def get_last_run(*, only_status: str | None = None) -> dict | None:
     except Exception as e:  # noqa: BLE001
         log("scraper_runs.get_last_failed", level="warn",
             error=f"{type(e).__name__}: {e}")
+        return None
+
+
+def get_last_run_for_user(user_id: str) -> dict | None:
+    """Return the most recent FINISHED run that's relevant to this user.
+
+    "Relevant" =
+      * any cron run (the cron processes every approved user, so it's the
+        user's last automatic refresh too) ; OR
+      * a manual run this user triggered themselves (`runner='manual'` AND
+        `triggered_by_user_id = user_id`).
+
+    `running` rows are excluded so the dashboard never advertises an in-flight
+    run as "last completed". Reads via service_role on purpose : the data we
+    return (started_at / status / runner) carries no PII, and we narrow the
+    WHERE clause server-side to rows the user "owns".
+
+    Returns None on miss / DB error — callers MUST fall back to whatever
+    secondary signal they had (e.g. max(scored_at)).
+    """
+    if not user_id:
+        return None
+    try:
+        # Supabase-py builds OR filters via the `or_` keyword on a
+        # comma-separated PostgREST expression.
+        res = (
+            get_service_client()
+            .table("scraper_runs")
+            .select("started_at,finished_at,status,runner,triggered_by_user_id")
+            .neq("status", "running")
+            .or_(f"runner.eq.cron,triggered_by_user_id.eq.{user_id}")
+            .order("started_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = list(res.data or [])
+        return rows[0] if rows else None
+    except Exception as e:  # noqa: BLE001
+        log("scraper_runs.get_last_for_user_failed", level="warn",
+            user_id=user_id, error=f"{type(e).__name__}: {e}")
         return None
 
 

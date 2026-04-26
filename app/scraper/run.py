@@ -65,17 +65,35 @@ from app.lib.storage import (  # noqa: E402
 )
 
 
-def _classify_run_status(stats: dict[str, int], *, top_level_error: bool) -> str:
+def _classify_run_status(
+    stats: dict[str, int],
+    *,
+    top_level_error: bool,
+    crashed_users: int = 0,
+) -> str:
     """Map per-run counters to one of {'ok', 'partial', 'failed'}.
 
     'failed'  : a top-level exception bubbled up (we caught it but the run
-                couldn't complete cleanly).
+                couldn't complete cleanly) OR every user we attempted to
+                process crashed (no one was processed successfully).
     'partial' : the run completed BUT at least one query / user / score
                 operation errored. Worth a glance from the admin.
     'ok'      : every checked counter is zero.
+
+    `crashed_users` is the number of per-user exceptions that bubbled out of
+    `_process_user`. Distinct from `failed_*` counters which count *internal*
+    failures during a user pass that didn't crash the user.
     """
     if top_level_error:
         return "failed"
+
+    users_processed = int(stats.get("users_processed", 0) or 0)
+    # Total wipeout : every attempted user crashed AND nothing was processed.
+    # Telemetrically this is failed, not partial — a partial run implies SOME
+    # work got done.
+    if crashed_users > 0 and users_processed == 0:
+        return "failed"
+
     failure_keys = (
         "failed_llm",
         "failed_upsert",
@@ -83,6 +101,8 @@ def _classify_run_status(stats: dict[str, int], *, top_level_error: bool) -> str
         "failed_queries",
         "custom_sources_failed",
     )
+    if crashed_users > 0:
+        return "partial"
     if any(int(stats.get(k, 0) or 0) > 0 for k in failure_keys):
         return "partial"
     return "ok"
@@ -210,6 +230,17 @@ def _score_and_persist(
                 error=f"{type(e).__name__}: {e}",
             )
             stats["failed_insert"] += 1
+
+        # The cooldown is purely a Groq rate-limit guard. Skip it when:
+        #   * the analysis came from the heuristic fallback (no network call
+        #     happened — sleeping is pure dead time), OR
+        #   * every LLM provider is exhausted (next iteration will go straight
+        #     to heuristic too — same reasoning, applied prospectively).
+        # Without this, a user with 40 jobs and a dead LLM eats 160s of sleep
+        # for nothing while the user stares at the dashboard spinner.
+        is_heuristic = isinstance(analysis, dict) and analysis.get("_method") == "heuristic"
+        if is_heuristic or llm_quota_state().get("all_exhausted"):
+            continue
         time.sleep(LLM_COOLDOWN_SEC)
 
     return scored_this_run
@@ -460,13 +491,20 @@ def run_for_user(user_id: str, *, dry_run: bool = False) -> dict[str, int]:
         )
         return {"_status": "error", "error": f"{type(e).__name__}: {e}"}
 
+    # `crashed_users=0` here : if _process_user had crashed, we'd already have
+    # returned "_status: error" with a finish_run('failed') above ; reaching
+    # this point means it returned cleanly (possibly with internal failures
+    # captured in the failed_* counters).
+    user_totals = {
+        **{k: v for k, v in stats.items() if isinstance(v, (int, float))},
+        "users_processed": 1,
+    }
     finish_run(
         run_id,
-        status=_classify_run_status(stats, top_level_error=False),
-        totals={
-            **{k: v for k, v in stats.items() if isinstance(v, (int, float))},
-            "users_processed": 1,
-        },
+        status=_classify_run_status(
+            user_totals, top_level_error=False, crashed_users=0,
+        ),
+        totals=user_totals,
         errors=[],
         llm_quota=llm_quota_state(),
     )
@@ -577,11 +615,15 @@ def main() -> None:
             deleted = cleanup_stale_jobs(days=60)
             print(f"[run] cleanup: deleted {deleted} stale job(s)")
 
-        # Status is 'partial' if any per-user crash hit errors_list OR any of
-        # the failure_keys counters are non-zero (handled inside _classify_run_status).
-        status = _classify_run_status(totals, top_level_error=False)
-        if errors_list and status == "ok":
-            status = "partial"
+        # Status classification accounts for both internal counters (failed_*)
+        # AND per-user crashes from errors_list. When EVERY user crashed and
+        # zero users got processed, we treat that as 'failed' — calling it
+        # 'partial' would understate the outage in the admin panel.
+        status = _classify_run_status(
+            totals,
+            top_level_error=False,
+            crashed_users=len(errors_list),
+        )
         finish_run(
             run_id,
             status=status,

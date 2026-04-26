@@ -26,11 +26,29 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+class _FakeSupabaseClient:
+    """Inert client — every chain call returns self ; .data is empty list."""
+    def __getattr__(self, _):
+        return self
+    def __call__(self, *a, **k):
+        return self
+    @property
+    def data(self):
+        return []
+
+
 def _build_supabase_client_stub() -> types.ModuleType:
-    """scorer only needs `_secret` from supabase_client. Return None so the
-    HTTP path is skipped — we drive the heuristic fallback directly."""
+    """scorer only needs `_secret` from supabase_client, but pytest / a later
+    `python <other_test>` invocation in the same process can import
+    app.lib.auth and trip on a missing symbol. Expose the full public surface
+    (get_anon_client / get_service_client / SUPABASE_AVAILABLE) to keep
+    sys.modules pollution from breaking downstream imports."""
     mod = types.ModuleType("app.lib.supabase_client")
     mod._secret = lambda *a, **k: None
+    mod.get_client         = lambda *a, **k: _FakeSupabaseClient()
+    mod.get_service_client = lambda *a, **k: _FakeSupabaseClient()
+    mod.get_anon_client    = lambda *a, **k: _FakeSupabaseClient()
+    mod.SUPABASE_AVAILABLE = True
     return mod
 
 

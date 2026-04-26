@@ -66,6 +66,10 @@ def _init_filter_state() -> None:
     st.session_state.setdefault("f_fav_only",   False)
     st.session_state.setdefault("f_limit",      100)
     st.session_state.setdefault("f_role_family", None)  # None = "Toutes"
+    # Re-entrancy lock for "Lancer une recherche". Prevents a double-click
+    # (or a second tab) from kicking off two parallel run_for_user() calls,
+    # which would double LLM consumption + open two scraper_runs rows.
+    st.session_state.setdefault("scrape_in_flight", False)
 
 
 # ---------------------------------------------------------------------------
@@ -126,23 +130,48 @@ def _format_relative(dt: datetime | None, *, now: datetime | None = None) -> str
     return f"le {dt.strftime('%Y-%m-%d')}"
 
 
-def _last_run_summary(matches: list[dict]) -> tuple[str, int]:
-    """Return (relative_when, jobs_in_last_24h) from the user's match rows.
+def _last_run_summary(
+    matches: list[dict],
+    *,
+    user_id: str | None = None,
+) -> tuple[str, int]:
+    """Return (relative_when, jobs_in_last_24h) for the dashboard freshness pill.
 
-    "Last run" is approximated as max(scored_at) across matches. Not perfect
-    (a run that produced 0 new matches is invisible), but it's the cheapest
-    signal that doesn't require a new dedicated table.
+    Two-tier resolution :
+      1. If `user_id` is provided AND `scraper_runs` exposes a finished row
+         relevant to this user (cron OR manual triggered_by_user_id), use its
+         `started_at` for the "last run" label. This is the source of truth
+         post-PR5 — it captures runs that produced zero new matches too.
+      2. Otherwise fall back to `max(scored_at)` across the user's matches —
+         the legacy heuristic from PR4 that's still right whenever telemetry
+         is unavailable (Supabase outage, RLS quirk, …).
+
+    `fresh` (matches in the last 24h) is always computed off `scored_at` —
+    it's a count of new offers, not run timestamps.
     """
-    if not matches:
-        return (_NO_LAST_RUN, 0)
-    parsed = [_parse_iso(m.get("scored_at")) for m in matches]
-    parsed = [p for p in parsed if p is not None]
-    if not parsed:
-        return (_NO_LAST_RUN, 0)
-    last = max(parsed)
+    # ---- fresh count (matches in last 24h) ------------------------------------
+    parsed_matches = [_parse_iso(m.get("scored_at")) for m in matches]
+    parsed_matches = [p for p in parsed_matches if p is not None]
     cutoff = datetime.now(timezone.utc).timestamp() - 86_400
-    fresh = sum(1 for p in parsed if p.timestamp() >= cutoff)
-    return (_format_relative(last), fresh)
+    fresh = sum(1 for p in parsed_matches if p.timestamp() >= cutoff)
+
+    # ---- last-run label (telemetry first, scored_at fallback) -----------------
+    last_dt: datetime | None = None
+    if user_id:
+        try:
+            from app.lib.scraper_runs_store import get_last_run_for_user
+            row = get_last_run_for_user(user_id)
+        except Exception:  # noqa: BLE001
+            row = None
+        if row:
+            last_dt = _parse_iso(row.get("started_at"))
+
+    if last_dt is None and parsed_matches:
+        last_dt = max(parsed_matches)
+
+    if last_dt is None:
+        return (_NO_LAST_RUN, fresh)
+    return (_format_relative(last_dt), fresh)
 
 
 # ---------------------------------------------------------------------------
@@ -188,14 +217,20 @@ def _render_action_bar(
     typically takes 30-90s for ~30 jobs (one LLM call per job). Acceptable
     for V1 — a job queue would be the right fix once we have multiple users.
     """
+    # Re-entrancy guard : if a previous click is still in flight (e.g. user
+    # clicked, then opened a second tab), disable the button. Streamlit serializes
+    # widgets per session but NOT across tabs, so the disabled state is the
+    # cheap user-side signal — combined with the spinner it's enough.
+    in_flight = bool(st.session_state.get("scrape_in_flight"))
     cols = st.columns([1.6, 3.4])
     with cols[0]:
         clicked = st.button(
-            "Lancer une recherche",
+            "Recherche en cours…" if in_flight else "Lancer une recherche",
             type="primary",
             use_container_width=True,
-            icon=":material/search:",
+            icon=":material/hourglass_top:" if in_flight else ":material/search:",
             key="action_run_search",
+            disabled=in_flight,
         )
     with cols[1]:
         # Vertical centering inside the column (button is ~38px tall).
@@ -224,17 +259,25 @@ def _render_action_bar(
         # snappy when the button isn't clicked.
         from app.scraper.run import run_for_user
 
-        with st.spinner(
-            "Kairo scrape les sites et score les nouvelles offres… "
-            "(30-90 s selon le nombre de queries)"
-        ):
-            try:
-                result = run_for_user(user_id)
-            except Exception as e:  # noqa: BLE001
-                # Defensive: run_for_user already absorbs most errors and
-                # returns _status="error", but we don't want a top-level
-                # crash to render a Streamlit traceback to the user.
-                result = {"_status": "error", "error": f"{type(e).__name__}: {e}"}
+        # Set the in-flight flag BEFORE the spinner so a re-render in another
+        # tab sees the disabled button. The `finally` clears it whether the
+        # call returned cleanly, raised, or returned _status="error" — without
+        # this the button stays stuck disabled forever on the unhappy path.
+        st.session_state["scrape_in_flight"] = True
+        try:
+            with st.spinner(
+                "Kairo scrape les sites et score les nouvelles offres… "
+                "(30-90 s selon le nombre de queries)"
+            ):
+                try:
+                    result = run_for_user(user_id)
+                except Exception as e:  # noqa: BLE001
+                    # Defensive: run_for_user already absorbs most errors and
+                    # returns _status="error", but we don't want a top-level
+                    # crash to render a Streamlit traceback to the user.
+                    result = {"_status": "error", "error": f"{type(e).__name__}: {e}"}
+        finally:
+            st.session_state["scrape_in_flight"] = False
 
         status = result.get("_status")
         if status == "user_not_found":
@@ -771,7 +814,7 @@ def main() -> None:
     # "freshness" stat). We accept up to 200 rows here; the real listing fetch
     # below applies the user's filters separately.
     _ab_matches = list_matches_for_user(user_id, limit=200)
-    _last_run_label, _fresh_24h = _last_run_summary(_ab_matches)
+    _last_run_label, _fresh_24h = _last_run_summary(_ab_matches, user_id=user_id)
     _render_action_bar(
         user_id,
         last_run_label=_last_run_label,

@@ -206,6 +206,72 @@ def test_last_run_summary_all_unparseable_falls_back_to_no_run():
     print("[OK] _last_run_summary falls back to 'Jamais lancé' when all rows unparseable")
 
 
+def test_last_run_summary_uses_scraper_runs_when_user_id_given():
+    """FIX-5 — when user_id is provided AND scraper_runs has a relevant row,
+    that row's started_at drives the 'last run' label, not max(scored_at)."""
+    ns = _load_ns()
+    now = datetime.now(timezone.utc)
+    run_started = (now - timedelta(hours=2)).isoformat()
+    fake = types.ModuleType("app.lib.scraper_runs_store")
+    fake.get_last_run_for_user = lambda uid: {
+        "started_at": run_started,
+        "status": "ok",
+        "runner": "manual",
+    }
+    sys.modules["app.lib.scraper_runs_store"] = fake
+    try:
+        # No matches at all → without telemetry, label would be 'Jamais lancé'.
+        # With telemetry, label should reflect the scraper_runs row.
+        label, fresh = ns["_last_run_summary"]([], user_id="uid-abc")
+        assert label != "Jamais lancé", label
+        assert "h" in label, label  # "il y a 2 h" or similar
+        assert fresh == 0
+    finally:
+        sys.modules.pop("app.lib.scraper_runs_store", None)
+    print("[OK] _last_run_summary: telemetry row drives label (FIX-5)")
+
+
+def test_last_run_summary_falls_back_when_telemetry_raises():
+    """FIX-5 — if scraper_runs_store raises or returns None, the function
+    must fall back to max(scored_at)."""
+    ns = _load_ns()
+    fake = types.ModuleType("app.lib.scraper_runs_store")
+
+    def _boom(uid):
+        raise RuntimeError("postgrest 500")
+
+    fake.get_last_run_for_user = _boom
+    sys.modules["app.lib.scraper_runs_store"] = fake
+    try:
+        now = datetime.now(timezone.utc)
+        matches = [{"scored_at": (now - timedelta(hours=3)).isoformat()}]
+        label, fresh = ns["_last_run_summary"](matches, user_id="uid-x")
+        assert label != "Jamais lancé", label
+        assert fresh == 1
+    finally:
+        sys.modules.pop("app.lib.scraper_runs_store", None)
+    print("[OK] _last_run_summary: telemetry exception → falls back to scored_at")
+
+
+def test_last_run_summary_falls_back_when_telemetry_returns_none():
+    """FIX-5 — telemetry returns None (no row for this user) → fall back to
+    max(scored_at). Regression : early code-paths that prematurely return
+    'Jamais lancé' even though scored_at would resolve."""
+    ns = _load_ns()
+    fake = types.ModuleType("app.lib.scraper_runs_store")
+    fake.get_last_run_for_user = lambda uid: None
+    sys.modules["app.lib.scraper_runs_store"] = fake
+    try:
+        now = datetime.now(timezone.utc)
+        matches = [{"scored_at": (now - timedelta(hours=4)).isoformat()}]
+        label, fresh = ns["_last_run_summary"](matches, user_id="uid-y")
+        assert label != "Jamais lancé", label
+        assert fresh == 1
+    finally:
+        sys.modules.pop("app.lib.scraper_runs_store", None)
+    print("[OK] _last_run_summary: telemetry None → falls back to scored_at")
+
+
 # ---------------------------------------------------------------------------
 # _group_by_family
 # ---------------------------------------------------------------------------
@@ -276,6 +342,9 @@ if __name__ == "__main__":
     test_last_run_summary_counts_24h_only()
     test_last_run_summary_skips_unparseable_rows()
     test_last_run_summary_all_unparseable_falls_back_to_no_run()
+    test_last_run_summary_uses_scraper_runs_when_user_id_given()
+    test_last_run_summary_falls_back_when_telemetry_raises()
+    test_last_run_summary_falls_back_when_telemetry_returns_none()
     test_group_by_family_counts_and_sorts()
     test_group_by_family_empty()
     test_group_by_family_no_analysis_key()
