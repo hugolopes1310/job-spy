@@ -264,6 +264,41 @@ def test_expires_at_datetime_is_coerced():
     print("[OK] _coerce_epoch handles datetime expires_at")
 
 
+def test_warmup_budget_is_generous_enough_for_streamlit_cloud():
+    """Cold-start regression — the iframe routinely needs ~1s to mount on
+    Streamlit Cloud. Budget = MAX × SLEEP must be ≥ 2s, otherwise users get
+    bounced to the login screen on every visit. (FIX-7)"""
+    state = _CookieStubState([None])
+    auth = _import_auth(cookie_state=state)
+    # We override SLEEP_S to 0 inside _import_auth for fast tests, so check
+    # the *defaults* on a fresh module load instead.
+    import importlib
+    sys.modules.pop("app.lib.auth", None)
+    fresh = importlib.import_module("app.lib.auth")
+    budget = fresh._COOKIE_WARMUP_MAX * fresh._COOKIE_WARMUP_SLEEP_S
+    assert budget >= 2.0, (
+        f"warmup budget too tight ({budget:.2f}s) — Streamlit Cloud cold "
+        f"starts need ≥2s for the cookie iframe to mount + post"
+    )
+    print(f"[OK] warmup budget = {budget:.2f}s (≥2s required)")
+
+
+def test_wait_for_cookie_flush_actually_sleeps():
+    """Login regression — after save_refresh_token() we must give the cookie
+    iframe time to flush its SET back to the browser before st.rerun() fires.
+    Without this pause, the cookie write is lost and the next visit has no
+    persistent session. (FIX-7)"""
+    state = _CookieStubState([None])
+    auth = _import_auth(cookie_state=state)
+    # Force a tiny non-zero flush so the test is deterministic but fast.
+    auth._COOKIE_FLUSH_SLEEP_S = 0.05
+    t0 = time.monotonic()
+    auth.wait_for_cookie_flush()
+    elapsed = time.monotonic() - t0
+    assert elapsed >= 0.04, f"wait_for_cookie_flush returned in {elapsed:.3f}s"
+    print(f"[OK] wait_for_cookie_flush blocks for ~{elapsed*1000:.0f}ms")
+
+
 def test_coerce_epoch_handles_garbage():
     """Malformed values return 0 (= "no expiry tracked") rather than raising."""
     state = _CookieStubState([None])
@@ -287,5 +322,7 @@ if __name__ == "__main__":
     test_successful_auth_resets_counter()
     test_existing_session_skips_warmup_entirely()
     test_expires_at_datetime_is_coerced()
+    test_warmup_budget_is_generous_enough_for_streamlit_cloud()
+    test_wait_for_cookie_flush_actually_sleeps()
     test_coerce_epoch_handles_garbage()
     print("\nAll auth cookie warm-up tests passed.")

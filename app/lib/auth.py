@@ -47,8 +47,18 @@ MIN_PASSWORD_LENGTH = 8
 # before giving up and returning None. Once auth succeeds (or definitively
 # fails) the counter is reset.
 _COOKIE_WARMUP_KEY = "_kairo_auth_cookie_warmup_attempts"
-_COOKIE_WARMUP_MAX = 2          # total reruns allowed
-_COOKIE_WARMUP_SLEEP_S = 0.15   # gap between reruns to let the iframe load
+# Budget tuned for Streamlit Cloud cold starts. The cookie iframe routinely
+# takes ~1s to mount + post on a fresh container; 5 × 0.4s = 2s gives us a
+# comfortable margin without delaying the login screen for users who really
+# aren't authenticated.
+_COOKIE_WARMUP_MAX = 5          # total reruns allowed
+_COOKIE_WARMUP_SLEEP_S = 0.4    # gap between reruns to let the iframe load
+
+# After save_refresh_token() at login time, give the iframe a moment to
+# flush the cookie write back to the browser before we rerun the page.
+# Without this, the user logs in → page reruns immediately → the SET command
+# never made it out of the iframe → next visit has no cookie.
+_COOKIE_FLUSH_SLEEP_S = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +139,9 @@ def verify_otp(email: str, code: str) -> tuple[bool, str]:
     # Persist the refresh token in a browser cookie so a page refresh (F5)
     # doesn't log the user out.
     save_refresh_token(session.refresh_token)
+    # Pause so the cookie iframe actually flushes the SET to the browser
+    # before our caller fires st.rerun() / st.switch_page().
+    wait_for_cookie_flush()
     return True, "Connecté."
 
 
@@ -240,6 +253,21 @@ def _coerce_epoch(value: Any) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0
+
+
+def wait_for_cookie_flush() -> None:
+    """Block briefly so the cookie iframe can flush a SET back to the browser.
+
+    Called right after `save_refresh_token()` at login time, before the caller
+    fires its `st.rerun()` / `st.switch_page()`. Without this pause the rerun
+    can land before the iframe has written the cookie, leaving the user with
+    no persistent session — they appear logged in for the current tab but get
+    bounced on the next visit.
+    """
+    try:
+        time.sleep(_COOKIE_FLUSH_SLEEP_S)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def consume_session_expired_message() -> str | None:
@@ -405,6 +433,7 @@ def signin_with_password(email: str, password: str) -> tuple[bool, str]:
     st.session_state["sb_user_email"]    = user.email
     st.session_state["sb_expires_at"]    = session.expires_at
     save_refresh_token(session.refresh_token)
+    wait_for_cookie_flush()
     return True, "Connecté."
 
 
