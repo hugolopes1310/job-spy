@@ -516,6 +516,7 @@ Tu dois produire une analyse structurée EN FRANÇAIS, au format JSON strict :
   "match_role": <int 0-10>,              // match titre/fonction avec une famille active (sémantique)
   "match_geo": <int 0-10>,               // 10 si dans geo.primary, 6-9 si geo.acceptable, 0 si geo.exclude
   "match_seniority": <int 0-10>,         // match avec seniority_band
+  "matched_role_family": "<label>" ou null,  // OBLIGATOIRE : le LABEL EXACT (copié-collé) de la famille active qui matche le mieux ce poste, ou null si aucune ne correspond du tout (métier complètement différent). NE PAS inventer — DOIT être l'un des labels listés dans "Familles de rôles cibles" ci-dessus.
   "red_flags": ["<3 max, très courts>"],
   "strengths": ["<3 max — atouts à mettre en avant en entretien>"],
   "salary": "<string ou null>",
@@ -1074,28 +1075,32 @@ def _heuristic_score_from_synthesis(
     company = _normalize(job.get("company"))
     location = _normalize(job.get("location"))
 
-    # Active families × their titles, weighted.
+    # Active families × their titles, weighted. We keep both the weight (drives
+    # match_role) and the label (drives matched_role_family for UI grouping).
     role_families = synthesis.get("role_families") or []
     active = [
         f for f in role_families if isinstance(f, dict) and f.get("active", True)
     ]
-    family_hits: list[float] = []
+    family_hits: list[tuple[float, str]] = []  # (weight, label)
     for f in active:
         weight = float(f.get("weight") or 0.0)
+        label = (f.get("label") or "").strip()
         for t in (f.get("titles") or []):
             tn = _normalize(t)
             if tn and tn in title:
-                family_hits.append(weight)
+                family_hits.append((weight, label))
                 break  # one hit per family suffices
     if family_hits:
         # Best family wins; cap influences ceiling.
-        best_w = max(family_hits)
+        best_w, best_label = max(family_hits, key=lambda x: x[0])
         match_role = max(2, min(10, round(10 * best_w)))
         # Multi-family hit gets a small boost.
         if len(family_hits) >= 2:
             match_role = min(10, match_role + 1)
+        matched_role_family = best_label or None
     else:
         match_role = 2
+        matched_role_family = None
 
     # Geo : primary > acceptable > exclude.
     geo = synthesis.get("geo") or {}
@@ -1160,6 +1165,7 @@ def _heuristic_score_from_synthesis(
         "match_role": match_role,
         "match_geo": match_geo,
         "match_seniority": match_seniority,
+        "matched_role_family": matched_role_family,
         "red_flags": ["Analyse heuristique (LLMs indisponibles)"],
         "strengths": [],
         "salary": None,
@@ -1168,6 +1174,28 @@ def _heuristic_score_from_synthesis(
         "apply_hint": None,
         "_method": "heuristic",
     }
+
+
+def _coerce_matched_family(value: Any, synthesis: dict[str, Any]) -> str | None:
+    """Validate the LLM's matched_role_family against the active family labels.
+
+    The LLM is instructed to copy-paste a label from the synthesis, but it
+    sometimes invents a near-miss ("Quant Risk Manager" instead of "Quant Risk")
+    or returns the empty string. We only accept exact label matches against
+    active families — anything else falls back to None so UI grouping stays
+    accurate. (Aggregating into "Sans famille" beats showing a phantom bucket.)
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    active_labels = {
+        (f.get("label") or "").strip()
+        for f in (synthesis.get("role_families") or [])
+        if isinstance(f, dict) and f.get("active", True) and f.get("label")
+    }
+    return v if v in active_labels else None
 
 
 def analyze_offer_with_synthesis(
@@ -1230,6 +1258,11 @@ def analyze_offer_with_synthesis(
         if v != -1:
             v = max(0, min(10, v))
         result[k] = v
+    # PR4.a — validate the LLM's family label against the synthesis. Drops
+    # invented near-misses, normalizes empty/missing to None.
+    result["matched_role_family"] = _coerce_matched_family(
+        result.get("matched_role_family"), synthesis
+    )
     return result
 
 

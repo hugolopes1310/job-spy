@@ -361,6 +361,43 @@ def _process_user(
     return stats
 
 
+# ---------------------------------------------------------------------------
+# Public single-user entry point (used by the dashboard "Lancer une recherche"
+# button — sync inline run from inside Streamlit). Same code path as the CLI
+# multi-user run, just narrowed to one user_id and returning the stats dict.
+# ---------------------------------------------------------------------------
+def run_for_user(user_id: str, *, dry_run: bool = False) -> dict[str, int]:
+    """Scrape + score for a single user_id, synchronously.
+
+    Returns the per-user `stats` dict from `_process_user` (counts of queries,
+    scraped, scored, failed_*, …). Adds a `_status` key:
+      - "ok"          : the run completed (look at scored / new_jobs for impact)
+      - "user_not_found"
+      - "error"       : something blew up at the top level (rare — most errors
+                        are absorbed inside _process_user)
+
+    Designed to be called from the dashboard with `with st.spinner(): …`. The
+    call is blocking (typical 30-90s for ~30 jobs), but it's the simplest path
+    that still gives the user a visible "fresh batch arrived" outcome.
+    """
+    try:
+        users = list_active_user_configs()
+    except Exception as e:  # noqa: BLE001
+        return {"_status": "error", "error": f"{type(e).__name__}: {e}"}
+
+    target = next((u for u in users if u.get("user_id") == user_id), None)
+    if target is None:
+        return {"_status": "user_not_found"}
+
+    try:
+        stats = _process_user(target, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001
+        return {"_status": "error", "error": f"{type(e).__name__}: {e}"}
+
+    stats["_status"] = "ok"
+    return stats
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Multi-user scraper (Phase 3)")
     p.add_argument("--user", help="Only process this user (by email)")

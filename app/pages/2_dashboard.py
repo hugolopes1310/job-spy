@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -64,6 +65,243 @@ def _init_filter_state() -> None:
     st.session_state.setdefault("f_min_score",  5)
     st.session_state.setdefault("f_fav_only",   False)
     st.session_state.setdefault("f_limit",      100)
+    st.session_state.setdefault("f_role_family", None)  # None = "Toutes"
+
+
+# ---------------------------------------------------------------------------
+# "Last run" helpers — used by the action bar to surface freshness
+# ---------------------------------------------------------------------------
+_NO_LAST_RUN = "Jamais lancé"
+
+
+def _parse_iso(value) -> datetime | None:
+    """Coerce Supabase 'scored_at' (ISO string OR datetime) to UTC datetime.
+    Returns None if the value is unparseable — better to show "—" than crash.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    # Supabase serializes timestamptz with a trailing 'Z' or '+00:00'. Python's
+    # fromisoformat accepts the latter natively but not 'Z' before 3.11.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _format_relative(dt: datetime | None, *, now: datetime | None = None) -> str:
+    """Human-readable 'il y a Xh / Xj' for the last-run badge.
+
+    Returns "—" if `dt` is None. Designed to read at a glance:
+      < 1 min : "à l'instant"
+      < 1 h   : "il y a 23 min"
+      < 24 h  : "il y a 5 h"
+      < 30 j  : "il y a 3 j"
+      else    : ISO date "le 2026-03-12"
+    """
+    if dt is None:
+        return "—"
+    now = now or datetime.now(timezone.utc)
+    delta = now - dt
+    s = int(delta.total_seconds())
+    if s < 0:
+        return "à l'instant"  # clock skew → don't display "in N min"
+    if s < 60:
+        return "à l'instant"
+    if s < 3600:
+        return f"il y a {s // 60} min"
+    if s < 86_400:
+        return f"il y a {s // 3600} h"
+    if s < 30 * 86_400:
+        return f"il y a {s // 86_400} j"
+    return f"le {dt.strftime('%Y-%m-%d')}"
+
+
+def _last_run_summary(matches: list[dict]) -> tuple[str, int]:
+    """Return (relative_when, jobs_in_last_24h) from the user's match rows.
+
+    "Last run" is approximated as max(scored_at) across matches. Not perfect
+    (a run that produced 0 new matches is invisible), but it's the cheapest
+    signal that doesn't require a new dedicated table.
+    """
+    if not matches:
+        return (_NO_LAST_RUN, 0)
+    parsed = [_parse_iso(m.get("scored_at")) for m in matches]
+    parsed = [p for p in parsed if p is not None]
+    if not parsed:
+        return (_NO_LAST_RUN, 0)
+    last = max(parsed)
+    cutoff = datetime.now(timezone.utc).timestamp() - 86_400
+    fresh = sum(1 for p in parsed if p.timestamp() >= cutoff)
+    return (_format_relative(last), fresh)
+
+
+# ---------------------------------------------------------------------------
+# Role-family chips helpers (PR4.c)
+# ---------------------------------------------------------------------------
+_NO_FAMILY_LABEL = "Sans famille"
+
+
+def _group_by_family(matches: list[dict]) -> list[tuple[str | None, int]]:
+    """Return [(family_label_or_None, count)] sorted by count desc.
+
+    `analysis.matched_role_family` is the source of truth — if absent or null,
+    the match falls into the "Sans famille" bucket. Used to render the chip
+    strip with counts.
+    """
+    counts: dict[str | None, int] = {}
+    for m in matches:
+        a = m.get("analysis") or {}
+        label = a.get("matched_role_family")
+        if isinstance(label, str):
+            label = label.strip() or None
+        else:
+            label = None
+        counts[label] = counts.get(label, 0) + 1
+    # Sort: real labels first (by count desc, then alpha), then "Sans famille".
+    real = sorted(
+        [(k, v) for k, v in counts.items() if k is not None],
+        key=lambda kv: (-kv[1], kv[0]),
+    )
+    no_fam = [(None, counts[None])] if None in counts else []
+    return real + no_fam
+
+
+def _render_action_bar(
+    user_id: str,
+    *,
+    last_run_label: str,
+    fresh_24h: int,
+) -> None:
+    """Top-of-page action bar : "Lancer une recherche" + freshness summary.
+
+    Sync inline trigger : we call run_for_user() with a spinner. The call
+    typically takes 30-90s for ~30 jobs (one LLM call per job). Acceptable
+    for V1 — a job queue would be the right fix once we have multiple users.
+    """
+    cols = st.columns([1.6, 3.4])
+    with cols[0]:
+        clicked = st.button(
+            "Lancer une recherche",
+            type="primary",
+            use_container_width=True,
+            icon=":material/search:",
+            key="action_run_search",
+        )
+    with cols[1]:
+        # Vertical centering inside the column (button is ~38px tall).
+        fresh_str = (
+            f"<span style=\"color:#0F172A;font-weight:600;\">{fresh_24h}</span> "
+            f"<span style=\"color:#64748B;\">"
+            f"{'nouvelle offre' if fresh_24h == 1 else 'nouvelles offres'} (24h)"
+            f"</span>"
+        )
+        st.markdown(
+            f"""
+<div style="height:100%;display:flex;align-items:center;
+            font-size:0.92rem;color:#475569;padding-left:0.5rem;">
+  <span>Dernière exécution&nbsp;:</span>
+  <span style="margin-left:0.4rem;color:#0F172A;font-weight:600;">{last_run_label}</span>
+  <span style="color:#CBD5E1;margin:0 0.7rem;">·</span>
+  {fresh_str}
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    if clicked:
+        # Lazy import — pulls in jobspy / requests / Supabase service client.
+        # Keeping it out of the module-level imports means the dashboard loads
+        # snappy when the button isn't clicked.
+        from app.scraper.run import run_for_user
+
+        with st.spinner(
+            "Kairo scrape les sites et score les nouvelles offres… "
+            "(30-90 s selon le nombre de queries)"
+        ):
+            try:
+                result = run_for_user(user_id)
+            except Exception as e:  # noqa: BLE001
+                # Defensive: run_for_user already absorbs most errors and
+                # returns _status="error", but we don't want a top-level
+                # crash to render a Streamlit traceback to the user.
+                result = {"_status": "error", "error": f"{type(e).__name__}: {e}"}
+
+        status = result.get("_status")
+        if status == "user_not_found":
+            st.error("Utilisateur introuvable côté scraper. Re-déconnecte / reconnecte-toi.")
+        elif status == "error":
+            st.error(f"La recherche a échoué : {result.get('error', 'erreur inconnue')}")
+        else:
+            scored = int(result.get("scored", 0))
+            new_jobs = int(result.get("new_jobs", 0))
+            failed_llm = int(result.get("failed_llm", 0))
+            if scored == 0 and new_jobs == 0:
+                st.info(
+                    "Aucune nouvelle offre n'a été trouvée cette fois — "
+                    "les sites sont déjà à jour. Réessaye dans quelques heures."
+                )
+            else:
+                msg = (
+                    f"Recherche terminée : **{scored}** nouvelles offres scorées "
+                    f"sur **{new_jobs}** offres uniques."
+                )
+                if failed_llm:
+                    msg += f" ({failed_llm} sans score — LLM indisponible.)"
+                st.success(msg)
+        # Force a rerun so the listing below reflects the freshly inserted matches.
+        st.rerun()
+
+
+def _render_role_family_chips(matches: list[dict]) -> None:
+    """Render the role-family filter strip ("Toutes (42) · Data Eng (12) · …").
+
+    Selection is mutually exclusive : clicking a chip sets `f_role_family` to
+    that label (or to None for "Toutes") and reruns. The actual filtering is
+    applied at render time on the matches list — we don't refetch.
+    """
+    groups = _group_by_family(matches)
+    if not groups:
+        return
+    total = sum(c for _, c in groups)
+
+    selected = st.session_state.get("f_role_family")
+    # "Toutes" + one chip per family. Single row, wraps if many families.
+    n_chips = 1 + len(groups)
+    cols = st.columns(n_chips)
+
+    if cols[0].button(
+        f"Toutes ({total})",
+        key="chip_fam_all",
+        use_container_width=True,
+        type="primary" if selected is None else "secondary",
+    ):
+        st.session_state["f_role_family"] = None
+        st.rerun()
+
+    for i, (label, count) in enumerate(groups):
+        display = label if label is not None else _NO_FAMILY_LABEL
+        # Truncate long labels so the chip stays readable.
+        if len(display) > 24:
+            display = display[:21] + "…"
+        is_active = (selected == label)
+        if cols[i + 1].button(
+            f"{display} ({count})",
+            key=f"chip_fam_{i}",
+            use_container_width=True,
+            type="primary" if is_active else "secondary",
+        ):
+            st.session_state["f_role_family"] = label
+            st.rerun()
 
 
 def _render_time_chips() -> None:
@@ -528,6 +766,20 @@ def main() -> None:
 
     _init_filter_state()
 
+    # ---- Action bar (Lancer recherche + last run) --------------------------
+    # Computed from a cheap unfiltered fetch (limited to recent rows for the
+    # "freshness" stat). We accept up to 200 rows here; the real listing fetch
+    # below applies the user's filters separately.
+    _ab_matches = list_matches_for_user(user_id, limit=200)
+    _last_run_label, _fresh_24h = _last_run_summary(_ab_matches)
+    _render_action_bar(
+        user_id,
+        last_run_label=_last_run_label,
+        fresh_24h=_fresh_24h,
+    )
+
+    st.markdown('<div style="height:0.9rem;"></div>', unsafe_allow_html=True)
+
     # ---- Time-range chips (row 1) ------------------------------------------
     st.markdown(
         '<div style="font-size:0.78rem;font-weight:600;letter-spacing:0.08em;'
@@ -588,6 +840,36 @@ def main() -> None:
         since_hours=since_hours,
         limit=int(st.session_state["f_limit"]),
     )
+
+    # ---- Role-family chips (counts on the time/score/status-filtered set) ---
+    # These let the user narrow further by which role_family the LLM put each
+    # offer in. Counts always reflect the post-fetch (pre-family-filter) set
+    # so the user can see the full distribution before clicking a chip.
+    if matches:
+        st.markdown(
+            '<div style="font-size:0.78rem;font-weight:600;letter-spacing:0.08em;'
+            'text-transform:uppercase;color:#94A3B8;margin:0.4rem 0 0.45rem;">'
+            'Famille de rôle</div>',
+            unsafe_allow_html=True,
+        )
+        _render_role_family_chips(matches)
+
+        # Apply the family filter to the displayed list. Done AFTER chip
+        # rendering so the counts reflect the full post-fetch set — clicking
+        # a chip narrows the list, not the counts (which would trap the user
+        # at zero everywhere except the active chip).
+        # f_role_family conventions:
+        #   None     → "Toutes" (no narrowing)
+        #   "<lbl>"  → narrow to matches whose analysis.matched_role_family == lbl
+        # The "Sans famille" bucket is currently visible in the chip strip
+        # for context but isn't clickable (we'd need a sentinel to round-trip
+        # None as a click target). Acceptable for V1.
+        sel_family = st.session_state.get("f_role_family")
+        if isinstance(sel_family, str) and sel_family:
+            matches = [
+                m for m in matches
+                if (m.get("analysis") or {}).get("matched_role_family") == sel_family
+            ]
 
     if not matches:
         with st.container(border=True):
