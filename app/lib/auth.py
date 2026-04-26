@@ -38,6 +38,18 @@ SESSION_EXPIRED_KEY = "auth_session_expired_msg"
 # Minimum enforced length for user-chosen passwords (matches Supabase default).
 MIN_PASSWORD_LENGTH = 8
 
+# --- Cookie warm-up retry budget -----------------------------------------
+# `extra-streamlit-components.CookieManager` runs in an iframe. On the first
+# script run after a hard refresh / cold start, the iframe hasn't posted its
+# cookies back yet, so `_read_cookies()` returns `{}` indistinguishable from
+# "no cookie set at all". To survive that race we allow `get_current_user()`
+# to issue a bounded number of `st.rerun()`s, sleeping briefly between each,
+# before giving up and returning None. Once auth succeeds (or definitively
+# fails) the counter is reset.
+_COOKIE_WARMUP_KEY = "_kairo_auth_cookie_warmup_attempts"
+_COOKIE_WARMUP_MAX = 2          # total reruns allowed
+_COOKIE_WARMUP_SLEEP_S = 0.15   # gap between reruns to let the iframe load
+
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -129,9 +141,16 @@ def get_current_user() -> CurrentUser | None:
     If `st.session_state` is empty (e.g. right after a hard refresh), we try
     to rehydrate from the refresh_token stored in a browser cookie.
 
-    If the token has expired AND the refresh fails, we set a one-shot session
-    flag so the login screen can show "ta session a expiré" instead of just
-    silently kicking the user.
+    The cookie iframe (`extra-streamlit-components`) is not always ready on
+    the first script run — its `get_all()` returns `{}` indistinguishable
+    from "user has no cookie at all". To avoid bouncing logged-in users to
+    the login screen on a hard refresh we allow up to `_COOKIE_WARMUP_MAX`
+    reruns, sleeping briefly each time, before concluding the user really
+    is not authenticated.
+
+    If the token has expired AND the refresh fails, we set a one-shot
+    session flag so the login screen can show "ta session a expiré" instead
+    of just silently kicking the user.
     """
     token = st.session_state.get("sb_access_token")
     if not token:
@@ -139,9 +158,24 @@ def get_current_user() -> CurrentUser | None:
         if _try_refresh_from_cookie():
             token = st.session_state.get("sb_access_token")
         if not token:
+            # Cookie was empty. Distinguish "iframe not yet loaded" (retry
+            # once) from "really not logged in" (fall through to None).
+            if _should_retry_cookie_warmup():
+                _bump_cookie_warmup_attempts()
+                # Sleep gives the component iframe a moment to post its
+                # cookies back to the server before the next script run.
+                time.sleep(_COOKIE_WARMUP_SLEEP_S)
+                st.rerun()
+                # `st.rerun()` raises a RerunException — code below never
+                # executes during the retry path. The `return None` is
+                # only reached if rerun is monkey-patched (e.g. tests).
+                return None
+            # Budget exhausted → really not logged in. Reset for the next
+            # script-level navigation so we don't carry the count forever.
+            _reset_cookie_warmup_attempts()
             return None
 
-    expires_at = st.session_state.get("sb_expires_at") or 0
+    expires_at = _coerce_epoch(st.session_state.get("sb_expires_at"))
     # Refresh if the token expires in <60s.
     if expires_at and expires_at - 60 < time.time():
         if not _try_refresh():
@@ -158,7 +192,54 @@ def get_current_user() -> CurrentUser | None:
     email   = st.session_state.get("sb_user_email")
     if not (user_id and email and token):
         return None
+
+    # Auth confirmed — clear the warm-up counter so a future hard refresh
+    # gets the full retry budget again.
+    _reset_cookie_warmup_attempts()
     return CurrentUser(user_id=user_id, email=email, access_token=token)
+
+
+# ---------------------------------------------------------------------------
+# Cookie warm-up helpers (private)
+# ---------------------------------------------------------------------------
+def _should_retry_cookie_warmup() -> bool:
+    """True iff we still have retries left before declaring the user logged out."""
+    attempts = int(st.session_state.get(_COOKIE_WARMUP_KEY, 0) or 0)
+    return attempts < _COOKIE_WARMUP_MAX
+
+
+def _bump_cookie_warmup_attempts() -> None:
+    st.session_state[_COOKIE_WARMUP_KEY] = (
+        int(st.session_state.get(_COOKIE_WARMUP_KEY, 0) or 0) + 1
+    )
+
+
+def _reset_cookie_warmup_attempts() -> None:
+    st.session_state.pop(_COOKIE_WARMUP_KEY, None)
+
+
+def _coerce_epoch(value: Any) -> int:
+    """Best-effort cast of a session expiry to a Unix timestamp (int).
+
+    Supabase mostly returns `expires_at` as an int, but some client versions
+    surface it as a `datetime`. We accept both — and shrug off anything else
+    so a malformed value doesn't blow up the auth path."""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    # datetime → epoch
+    try:
+        from datetime import datetime
+        if isinstance(value, datetime):
+            return int(value.timestamp())
+    except Exception:  # noqa: BLE001
+        pass
+    # Last resort: try to parse a numeric string.
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
 
 
 def consume_session_expired_message() -> str | None:

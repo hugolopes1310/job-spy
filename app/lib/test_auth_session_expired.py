@@ -28,6 +28,10 @@ def _build_streamlit_stub() -> types.ModuleType:
     st.warning = lambda *a, **k: None
     st.info = lambda *a, **k: None
     st.stop = lambda: None
+    # `get_current_user` may call `st.rerun()` during the cookie warm-up
+    # branch; in tests we make it a no-op so the function can fall through
+    # to `return None` instead of raising RerunException.
+    st.rerun = lambda *a, **k: None
     st.secrets = {}
     return st
 
@@ -65,11 +69,17 @@ def _build_supabase_client_stub() -> types.ModuleType:
 
 
 def _import_auth():
+    import importlib
     sys.modules["streamlit"]                  = _build_streamlit_stub()
     sys.modules["app.lib.session_cookies"]    = _build_cookies_stub()
     sys.modules["app.lib.supabase_client"]    = _build_supabase_client_stub()
     sys.modules.pop("app.lib.auth", None)
-    from app.lib import auth  # noqa: E402
+    # `import_module` forces re-execution of auth's top level; the regular
+    # `from app.lib import auth` syntax returns the package's cached attr
+    # and would silently keep references to a previous test's stubs.
+    auth = importlib.import_module("app.lib.auth")
+    # Don't actually sleep between cookie warm-up reruns in tests.
+    auth._COOKIE_WARMUP_SLEEP_S = 0
     return auth
 
 
