@@ -44,9 +44,11 @@ from app.lib.jobs_store import (  # noqa: E402
     upsert_job,
 )
 from app.lib.klog import bind  # noqa: E402
-from app.lib.query_builder import build_queries  # noqa: E402
+from app.lib.profile_synthesis_store import load_active_synthesis  # noqa: E402
+from app.lib.query_builder import build_queries, build_queries_from_synthesis  # noqa: E402
 from app.lib.scorer import (  # noqa: E402
     analyze_offer_for_user,
+    analyze_offer_with_synthesis,
     llm_quota_state,
     make_parse_failed_analysis,
 )
@@ -87,6 +89,8 @@ def _score_and_persist(
     dry_run: bool,
     source_label: str,
     logger,
+    synthesis: dict | None = None,
+    synthesis_id: str | None = None,
 ) -> int:
     """Shared tail of the scrape loop: upsert + dedupe + score + insert match.
 
@@ -134,7 +138,10 @@ def _score_and_persist(
             "description": raw_job.get("description"),
         }
         try:
-            analysis = analyze_offer_for_user(config, cv_text, job_for_llm)
+            if synthesis is not None:
+                analysis = analyze_offer_with_synthesis(synthesis, cv_text, job_for_llm)
+            else:
+                analysis = analyze_offer_for_user(config, cv_text, job_for_llm)
         except Exception as e:  # noqa: BLE001
             # Defensive: scorer is supposed to never raise (returns None on
             # failure), but if a refactor ever breaks that contract we don't
@@ -156,12 +163,14 @@ def _score_and_persist(
                     user_id, job_id,
                     score=None,
                     analysis=make_parse_failed_analysis("llm_unavailable"),
+                    profile_synthesis_id=synthesis_id,
                 )
             else:
                 insert_match(
                     user_id, job_id,
                     score=analysis.get("score"),
                     analysis=analysis,
+                    profile_synthesis_id=synthesis_id,
                 )
                 stats["scored"] += 1
                 scored_this_run += 1
@@ -207,18 +216,56 @@ def _process_user(
         "failed_queries": 0,
         "custom_sources_ok": 0,
         "custom_sources_failed": 0,
+        "path": "config",  # 'synthesis' once Phase 4 row exists for this user
     }
 
-    queries = build_queries(config, hours_old=HOURS_OLD, results_per_query=RESULTS_PER_QUERY)
+    # Phase 4 path : if the user has an active profile synthesis, drive both
+    # the query expansion AND the scorer prompt from it. Otherwise fall back
+    # to the legacy user_config path so unmigrated users keep working.
+    synthesis_row: dict | None = None
+    synthesis: dict | None = None
+    synthesis_id: str | None = None
+    try:
+        synthesis_row = load_active_synthesis(user_id, use_service=True)
+    except Exception as e:  # noqa: BLE001
+        logger.warn("scrape.synthesis_load_failed", error=f"{type(e).__name__}: {e}")
+        synthesis_row = None
+
+    if synthesis_row and isinstance(synthesis_row.get("synthesis"), dict):
+        synthesis = synthesis_row["synthesis"]
+        synthesis_id = synthesis_row.get("id")
+        queries = build_queries_from_synthesis(
+            synthesis,
+            hours_old=HOURS_OLD,
+            results_per_query=RESULTS_PER_QUERY,
+            sites=config.get("active_sources"),
+        )
+        stats["path"] = "synthesis"
+        logger.info(
+            "scrape.synthesis_loaded",
+            synthesis_id=synthesis_id,
+            version=synthesis_row.get("version"),
+            queries=len(queries),
+        )
+    else:
+        queries = build_queries(
+            config, hours_old=HOURS_OLD, results_per_query=RESULTS_PER_QUERY
+        )
+
     custom_sources = config.get("custom_career_sources") or []
 
     if not queries and not custom_sources:
-        logger.info("scrape.skip_user", reason="no_queries_no_sources")
+        logger.info("scrape.skip_user", reason="no_queries_no_sources", path=stats["path"])
         return stats
 
     stats["queries"] = len(queries)
     if queries:
-        logger.info("scrape.user_start", queries=len(queries), custom_sources=len(custom_sources))
+        logger.info(
+            "scrape.user_start",
+            queries=len(queries),
+            custom_sources=len(custom_sources),
+            path=stats["path"],
+        )
 
     scored_this_run = 0
     for q in queries:
@@ -245,6 +292,8 @@ def _process_user(
             dry_run=dry_run,
             source_label=q_label,
             logger=q_logger,
+            synthesis=synthesis,
+            synthesis_id=synthesis_id,
         )
 
         if scored_this_run >= MAX_JOBS_SCORED_PER_USER_PER_RUN:
@@ -304,6 +353,8 @@ def _process_user(
             dry_run=dry_run,
             source_label=f"custom:{src_label}",
             logger=src_logger,
+            synthesis=synthesis,
+            synthesis_id=synthesis_id,
         )
 
     logger.info("scrape.user_done", **stats)

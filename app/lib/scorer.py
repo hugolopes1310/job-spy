@@ -409,6 +409,257 @@ RÈGLES OPÉRATIONNELLES
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 — synthesis-driven prompt builders
+# ---------------------------------------------------------------------------
+def _summarize_synthesis(synthesis: dict[str, Any], cv_text: str) -> str:
+    """Compact, LLM-friendly synthesis dump (Phase 4 path).
+
+    Same shape and tone as `_summarize_profile`, but consumes the structured
+    synthesis (role_families, geo.{primary,acceptable,exclude}, seniority_band,
+    deal_breakers, dream_companies, languages). Inactive role_families are
+    skipped so their titles don't leak into the role match.
+    """
+    role_families = synthesis.get("role_families") or []
+    active_families = [
+        f for f in role_families if isinstance(f, dict) and f.get("active", True)
+    ]
+    active_families.sort(key=lambda f: float(f.get("weight") or 0.0), reverse=True)
+
+    if active_families:
+        family_lines = []
+        for f in active_families:
+            label = (f.get("label") or "").strip() or "?"
+            titles = ", ".join(t for t in (f.get("titles") or []) if (t or "").strip())
+            weight = float(f.get("weight") or 0.0)
+            family_lines.append(
+                f"  - {label} (poids {weight:.2f}) : {titles or '?'}"
+            )
+        roles_block = "\n".join(family_lines)
+    else:
+        roles_block = "  (aucune famille active)"
+
+    geo = synthesis.get("geo") or {}
+    primary = ", ".join(s for s in (geo.get("primary") or []) if s) or "non spécifié"
+    acceptable = ", ".join(s for s in (geo.get("acceptable") or []) if s) or "aucune"
+    exclude = ", ".join(s for s in (geo.get("exclude") or []) if s) or "aucune"
+
+    sb = synthesis.get("seniority_band") or {}
+    sb_label = (sb.get("label") or "?").strip() or "?"
+    yoe_min = sb.get("yoe_min")
+    yoe_max = sb.get("yoe_max")
+    if yoe_min is not None and yoe_max is not None:
+        sb_str = f"{sb_label} ({yoe_min}-{yoe_max} ans XP)"
+    else:
+        sb_str = sb_label
+
+    breakers = ", ".join(d for d in (synthesis.get("deal_breakers") or []) if d) or "aucun"
+    dream = ", ".join(c for c in (synthesis.get("dream_companies") or []) if c) or "aucune"
+    languages = ", ".join(l for l in (synthesis.get("languages") or []) if l) or "non spécifié"
+    summary_fr = (synthesis.get("summary_fr") or "").strip()
+
+    # Open questions answered by the user are signal — fold them in as raw text
+    # so the LLM can read them as user-stated facts.
+    answered_oq = []
+    for q in synthesis.get("open_questions") or []:
+        if not isinstance(q, dict):
+            continue
+        a = (q.get("answer") or "").strip()
+        if a:
+            answered_oq.append(f"  - {q.get('text', '?')} → {a}")
+    oq_block = ""
+    if answered_oq:
+        oq_block = "\n--- Réponses user (open questions) ---\n" + "\n".join(answered_oq)
+
+    cv_excerpt = (cv_text or "").strip()[:2500]
+    cv_line = f"\n--- CV (extrait) ---\n{cv_excerpt}" if cv_excerpt else ""
+
+    summary_line = f"Synthèse profil : {summary_fr}\n\n" if summary_fr else ""
+
+    return (
+        f"{summary_line}"
+        f"--- Familles de rôles cibles (par priorité) ---\n"
+        f"{roles_block}\n"
+        f"\n--- Séniorité visée ---\n"
+        f"{sb_str}\n"
+        f"\n--- Géo ---\n"
+        f"Primaire : {primary}\n"
+        f"Acceptable : {acceptable}\n"
+        f"Exclu : {exclude}\n"
+        f"\n--- Langues ---\n{languages}\n"
+        f"\n--- Companies rêvées ---\n{dream}\n"
+        f"\n--- DEAL-BREAKERS (tue le score si STRUCTURANTS) ---\n{breakers}"
+        f"{oq_block}"
+        f"{cv_line}"
+    )
+
+
+def build_system_prompt_from_synthesis(synthesis: dict[str, Any], cv_text: str) -> str:
+    """System prompt for `analyze_offer_with_synthesis` — same formula and
+    adversarial examples as `build_system_prompt`, but the profile block is
+    sourced from the structured synthesis instead of user_config.
+
+    Keeps the contract (output schema, scoring formula, deal-breaker rules)
+    identical so the dashboard can render results from either path.
+    """
+    profile_block = _summarize_synthesis(synthesis, cv_text)
+
+    return f"""Tu es un recruteur senior qui évalue une offre pour ce candidat précis :
+
+{profile_block}
+
+Tu dois produire une analyse structurée EN FRANÇAIS, au format JSON strict :
+
+{{
+  "_reasoning": "<3 phrases — étapes 1→6 du processus ci-dessous, pour cadrer ton raisonnement>",
+  "score": <int 0-10>,                   // score global de fit (issu de la FORMULE)
+  "reason": "<1 phrase FR synthèse, lisible côté UI>",
+  "match_role": <int 0-10>,              // match titre/fonction avec une famille active (sémantique)
+  "match_geo": <int 0-10>,               // 10 si dans geo.primary, 6-9 si geo.acceptable, 0 si geo.exclude
+  "match_seniority": <int 0-10>,         // match avec seniority_band
+  "red_flags": ["<3 max, très courts>"],
+  "strengths": ["<3 max — atouts à mettre en avant en entretien>"],
+  "salary": "<string ou null>",
+  "contact": "<string ou null>",
+  "deadline": "<YYYY-MM-DD ou string ou null>",
+  "apply_hint": "<string courte — ex: 'Easy Apply', 'Via site carrière'>"
+}}
+
+═══════════════════════════════════════════════════════════════════
+PROCESSUS À SUIVRE (raisonne dans `_reasoning` avant de scorer)
+═══════════════════════════════════════════════════════════════════
+
+ÉTAPE 1 — Identifier le titre exact du poste (champ Titre, ou 1ère phrase
+          de la description si Titre est ambigu/générique).
+
+ÉTAPE 2 — match_role (0-10) : à quel point le titre correspond
+          SÉMANTIQUEMENT à un des titres listés dans une famille active ?
+          - 10 = match exact ou synonyme strict avec une famille de poids >= 0.8
+          - 7-9 = match avec une famille de poids 0.5-0.8, OU rôle voisin
+            d'une famille forte (même desk / compétences identiques)
+          - 4-6 = rôle adjacent au sein du même secteur mais axe différent
+          - 0-3 = métier différent (Sales pur, Compliance, Audit, IT…
+            quand aucune famille ne couvre ces verticales)
+
+          IMPORTANT : pondère toujours par le `poids` de la famille qui matche.
+          Un match exact sur une famille de poids 0.4 plafonne match_role à 7.
+
+ÉTAPE 3 — match_geo (0-10) :
+          - 10 = la localisation est dans `geo.primary` (ou ville voisine
+            évidente : Genève=Geneva=Nyon ; Zurich=Zürich=Zug à 30km près)
+          - 6-9 = dans `geo.acceptable`, ou même pays à <2h de train
+          - 3-5 = même région large
+          - 0-2 = totalement off, OU dans `geo.exclude` (cap à 0 si exclude)
+          - REMOTE : si l'offre est 100% remote ET les open_questions
+            indiquent que le user accepte le remote → 10 indépendamment
+            de la ville annoncée.
+
+ÉTAPE 4 — match_seniority (0-10) :
+          - 10 = pile dans seniority_band (label ET fourchette yoe)
+          - 7-9 = un cran au-dessus ou en dessous
+          - 4-6 = deux crans d'écart
+          - 0-3 = MD/VP si target=junior, ou intern si target=senior
+
+ÉTAPE 5 — DEAL-BREAKER STRUCTURANT ? (vital — anti-spillover)
+          Un deal_breaker n'a d'effet QUE s'il décrit le CŒUR du poste.
+          → Cherche dans : Titre + 1ère phrase de la description.
+          → Si le mot apparaît juste en passant ("travailler avec les équipes
+             audit", "support compliance", "interface back-office") =
+             ORPHELIN, on IGNORE.
+
+          Cas où on cap le score à 0-2 :
+            * Titre contient un deal_breaker en position structurante
+              (Auditor, Compliance Officer, Middle Office, Settlement…)
+            * Type contrat = stage/alternance/internship si "intern"/"stage"
+              est dans deal_breakers
+            * Software Engineer / IT / DevOps si target finance + ces tokens
+              sont en deal_breakers
+            * Géo dans `geo.exclude` (override score)
+
+ÉTAPE 6 — BONUS dream company :
+          - 10 si l'entreprise figure dans `dream_companies`
+            (matching FUZZY : "Pictet Group" = "Pictet AM" = "Pictet")
+          - 0 sinon.
+
+═══════════════════════════════════════════════════════════════════
+FORMULE DU SCORE GLOBAL (applique-la, ne devine pas)
+═══════════════════════════════════════════════════════════════════
+
+base = 0.40 × match_role
+     + 0.30 × match_geo
+     + 0.20 × match_seniority
+     + 0.10 × bonus_dream_co
+
+Puis :
+  - Si DEAL-BREAKER STRUCTURANT (étape 5) : score = min(2, round(base))
+  - Sinon, si géo dans `exclude` : score = min(2, round(base))
+  - Sinon, si bonus_dream_co = 10 ET match_role >= 7 : score = max(8, round(base))
+  - Sinon, si bonus_dream_co = 10 ET match_role >= 4 : score = max(7, round(base))
+  - Sinon : score = round(base), clampé à [0, 10]
+
+═══════════════════════════════════════════════════════════════════
+EXEMPLES (4 cas adversariaux)
+═══════════════════════════════════════════════════════════════════
+
+EX1 — DEAL-BREAKER ORPHELIN (anti-spill majeur)
+"Equity Derivatives Structurer @ Pictet, Geneva. Description : ... vous
+travaillerez en interaction étroite avec les équipes Audit et Compliance ..."
+→ "audit"/"compliance" sont ORPHELINS (mention en passant, pas le métier).
+   match_role=10, match_geo=10, match_seniority=8, dream_co=10.
+   base = 4 + 3 + 1.6 + 1 = 9.6 → 10. Pas de cap. SCORE = **10**.
+
+EX2 — DREAM CO + RÔLE ADJACENT
+"Risk Manager Equity Derivatives @ Pictet, Geneva" (familles : Structurer
+poids 1.0, Quant Risk poids 0.6) → match_role=8 (match direct famille 0.6
++ adjacent à Structurer), match_geo=10, match_seniority=8, dream_co=10.
+   base = 3.2 + 3 + 1.6 + 1 = 8.8. Bonus dream_co + match_role>=7 force
+   floor 8. SCORE = **9**.
+
+EX3 — FULL REMOTE SANS MATCH GÉO
+"Quant Developer (100% remote) @ Trafigura, London" (geo.primary=Geneva,
+open_question "remote ok"=oui). Match_role=8, match_seniority=9, dream_co=0.
+match_geo=10 grâce au remote (override location). base = 3.2 + 3 + 1.8 + 0
+= 8.0 → SCORE = **8**.
+
+EX4 — SÉNIORITÉ TROP HAUTE
+"Managing Director Equity Solutions @ JP Morgan, Geneva"
+(seniority_band=mid, yoe 3-7) → match_role=9, match_geo=10,
+match_seniority=2 (MD = 4 crans au-dessus), dream_co=0.
+base = 3.6 + 3 + 0.4 + 0 = 7.0 → SCORE = **7**.
+
+═══════════════════════════════════════════════════════════════════
+VÉRIFICATION FINALE (avant de retourner le JSON)
+═══════════════════════════════════════════════════════════════════
+
+V1 — Le score colle-t-il à la formule ? Recompute :
+     round(0.4·match_role + 0.3·match_geo + 0.2·match_seniority + 0.1·dream_co)
+     Si écart > 1 sans deal-breaker, recale.
+
+V2 — As-tu confondu un deal_breaker ORPHELIN avec un STRUCTURANT ? Si le
+     titre n'est PAS un titre du métier deal-breakeur et que tu as quand
+     même cap à 2 → REMONTE le score à la base.
+
+V3 — Si l'entreprise est dans dream_companies ET match_role >= 4, le score
+     est >= 7. Si tu as mis < 7, recale.
+
+V4 — Si la localisation tombe dans geo.exclude, le score est <= 2 quoi
+     qu'il arrive (sauf remote explicite override).
+
+═══════════════════════════════════════════════════════════════════
+RÈGLES OPÉRATIONNELLES
+═══════════════════════════════════════════════════════════════════
+
+- Match sémantique, jamais littéral. "Customised Solutions Specialist" =
+  match avec "Investment Solutions Structurer".
+- Le poids d'une famille module match_role : un match parfait sur famille
+  de poids 0.4 ≠ un match parfait sur famille de poids 1.0.
+- Ne jamais inventer salary/contact/deadline → null si absent.
+- Red flags & strengths : 3 max chacun, phrases courtes.
+- Tu réponds UNIQUEMENT avec le JSON (commence par '{{', finis par '}}').
+  Pas de markdown, pas de préambule, pas de commentaire après.
+"""
+
+
+# ---------------------------------------------------------------------------
 # Groq HTTP
 # ---------------------------------------------------------------------------
 def _call_groq(system: str, user_msg: str, *, max_tokens: int = 700) -> dict | None:
@@ -795,6 +1046,182 @@ def analyze_offer_for_user(
         s = 0
     result["score"] = max(0, min(10, s))
     # Sub-scores: clamp too. -1 stays as the "not provided" sentinel.
+    for k in ("match_role", "match_geo", "match_seniority"):
+        try:
+            v = int(result.get(k) if result.get(k) is not None else -1)
+        except (TypeError, ValueError):
+            v = -1
+        if v != -1:
+            v = max(0, min(10, v))
+        result[k] = v
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — synthesis-driven heuristic fallback + public API
+# ---------------------------------------------------------------------------
+def _heuristic_score_from_synthesis(
+    synthesis: dict[str, Any],
+    cv_text: str,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Local rules-based fallback when all LLMs are down (synthesis path).
+
+    Mirrors `_heuristic_score` but consumes the structured synthesis. Same
+    output schema, with `_method = "heuristic"` so the UI flags it.
+    """
+    title = _normalize(job.get("title"))
+    company = _normalize(job.get("company"))
+    location = _normalize(job.get("location"))
+
+    # Active families × their titles, weighted.
+    role_families = synthesis.get("role_families") or []
+    active = [
+        f for f in role_families if isinstance(f, dict) and f.get("active", True)
+    ]
+    family_hits: list[float] = []
+    for f in active:
+        weight = float(f.get("weight") or 0.0)
+        for t in (f.get("titles") or []):
+            tn = _normalize(t)
+            if tn and tn in title:
+                family_hits.append(weight)
+                break  # one hit per family suffices
+    if family_hits:
+        # Best family wins; cap influences ceiling.
+        best_w = max(family_hits)
+        match_role = max(2, min(10, round(10 * best_w)))
+        # Multi-family hit gets a small boost.
+        if len(family_hits) >= 2:
+            match_role = min(10, match_role + 1)
+    else:
+        match_role = 2
+
+    # Geo : primary > acceptable > exclude.
+    geo = synthesis.get("geo") or {}
+    primary = [_normalize(s) for s in (geo.get("primary") or []) if s]
+    acceptable = [_normalize(s) for s in (geo.get("acceptable") or []) if s]
+    exclude = [_normalize(s) for s in (geo.get("exclude") or []) if s]
+    in_exclude = bool(location) and any(s and s in location for s in exclude)
+    if location and any(s and s in location for s in primary):
+        match_geo = 10
+    elif location and any(s and s in location for s in acceptable):
+        match_geo = 7
+    elif in_exclude:
+        match_geo = 0
+    else:
+        match_geo = 4
+
+    # Seniority — heuristic on title tokens against seniority_band.label.
+    sb = synthesis.get("seniority_band") or {}
+    sb_label = _normalize(sb.get("label"))
+    if sb_label and sb_label in title:
+        match_seniority = 10
+    elif not sb_label:
+        match_seniority = 5
+    else:
+        match_seniority = 5
+
+    # Dream company bonus (substring, fuzzy).
+    dream = [_normalize(c) for c in (synthesis.get("dream_companies") or []) if c]
+    dream_bonus = 10 if any(c and c in company for c in dream) else 0
+
+    # Deal-breakers — synthesis-defined tokens, title-only match.
+    deal_breakers = [_normalize(d) for d in (synthesis.get("deal_breakers") or []) if d]
+    deal_breaker_hit = any(d and d in title for d in deal_breakers)
+
+    base = (
+        0.40 * match_role
+        + 0.30 * match_geo
+        + 0.20 * match_seniority
+        + 0.10 * dream_bonus
+    )
+    if deal_breaker_hit or in_exclude:
+        score = min(2, round(base))
+    elif dream_bonus == 10 and match_role >= 7:
+        score = max(8, round(base))
+    elif dream_bonus == 10 and match_role >= 4:
+        score = max(7, round(base))
+    else:
+        score = round(base)
+    score = max(0, min(10, score))
+
+    log(
+        "scorer.heuristic_fallback_synthesis",
+        level="warn",
+        title=title[:60],
+        company=company[:30],
+        score=score,
+    )
+
+    return {
+        "score": score,
+        "reason": "Score calculé localement depuis la synthèse (LLMs indisponibles).",
+        "match_role": match_role,
+        "match_geo": match_geo,
+        "match_seniority": match_seniority,
+        "red_flags": ["Analyse heuristique (LLMs indisponibles)"],
+        "strengths": [],
+        "salary": None,
+        "contact": None,
+        "deadline": None,
+        "apply_hint": None,
+        "_method": "heuristic",
+    }
+
+
+def analyze_offer_with_synthesis(
+    synthesis: dict[str, Any],
+    cv_text: str,
+    job: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Score one (synthesis × job) pair. Same 3-layer reliability as
+    `analyze_offer_for_user` :
+      1. LLM call (Groq → Gemini) with the synthesis-aware prompt.
+      2. Self-correction retry on parse failure (skip if both providers exhausted).
+      3. Heuristic fallback driven by the synthesis.
+    """
+    system = build_system_prompt_from_synthesis(synthesis, cv_text)
+    user_msg = (
+        f"Titre : {job.get('title') or ''}\n"
+        f"Entreprise : {job.get('company') or ''}\n"
+        f"Lieu : {job.get('location') or ''}\n"
+        f"Description :\n{(job.get('description') or '')[:2500]}"
+    )
+
+    result = _call_llm(system, user_msg)
+
+    if result is None and not (_GROQ_TPD_EXHAUSTED and _GEMINI_QUOTA_EXHAUSTED):
+        log("scorer.self_correction_retry", level="info", path="synthesis")
+        result = _call_llm(system, user_msg + _SELF_CORRECTION_SUFFIX)
+
+    if result is None:
+        log(
+            "scorer.fallback_to_heuristic",
+            level="warn",
+            path="synthesis",
+            title=(job.get("title") or "")[:60],
+        )
+        return _heuristic_score_from_synthesis(synthesis, cv_text, job)
+
+    result = _strip_internal_keys(result)
+
+    # Same normalization tail as analyze_offer_for_user.
+    result.setdefault("score", 0)
+    result.setdefault("reason", "")
+    for k in ("match_role", "match_geo", "match_seniority"):
+        result.setdefault(k, -1)
+    for k in ("red_flags", "strengths"):
+        v = result.get(k)
+        if not isinstance(v, list):
+            result[k] = []
+    for k in ("salary", "contact", "deadline", "apply_hint"):
+        result.setdefault(k, None)
+    try:
+        s = int(result.get("score") or 0)
+    except (TypeError, ValueError):
+        s = 0
+    result["score"] = max(0, min(10, s))
     for k in ("match_role", "match_geo", "match_seniority"):
         try:
             v = int(result.get(k) if result.get(k) is not None else -1)

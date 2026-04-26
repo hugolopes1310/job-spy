@@ -276,17 +276,28 @@ def insert_match(
     job_id: str,
     score: int | None,
     analysis: dict | None,
+    *,
+    profile_synthesis_id: str | None = None,
 ) -> None:
-    """Write a fresh (user_id, job_id) row. service_role (scraper)."""
+    """Write a fresh (user_id, job_id) row. service_role (scraper).
+
+    `profile_synthesis_id` (Phase 4) links the match to the synthesis version
+    used to score it. Persisted only when provided so the column stays NULL
+    on legacy / config-only runs (FK has ON DELETE SET NULL).
+    """
+    row: dict[str, Any] = {
+        "user_id": user_id,
+        "job_id": job_id,
+        "score": score,
+        "analysis": analysis,
+        "status": "new",
+        "scored_at": _now(),
+    }
+    if profile_synthesis_id is not None:
+        row["profile_synthesis_id"] = profile_synthesis_id
+
     get_service_client().table("user_job_matches").upsert(
-        {
-            "user_id": user_id,
-            "job_id": job_id,
-            "score": score,
-            "analysis": analysis,
-            "status": "new",
-            "scored_at": _now(),
-        },
+        row,
         on_conflict="user_id,job_id",
     ).execute()
 
