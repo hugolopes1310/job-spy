@@ -66,6 +66,12 @@ class _CtxStub:
     def page_link(self, *a, **k):
         pass
 
+    def metric(self, *a, **k):
+        pass
+
+    def code(self, *a, **k):
+        pass
+
 
 def _fake_columns(spec, **k):
     n = len(spec) if isinstance(spec, (list, tuple)) else int(spec)
@@ -107,6 +113,8 @@ def _build_streamlit_stub() -> types.ModuleType:
     st.slider           = lambda *a, **k: k.get("value", 0)
     st.multiselect      = lambda *a, **k: list(k.get("default", []))
     st.file_uploader    = lambda *a, **k: None
+    st.code             = lambda *a, **k: None
+    st.metric           = lambda *a, **k: None
     st.columns          = _fake_columns
     st.container        = _fake_container
     st.expander         = _fake_expander
@@ -371,6 +379,148 @@ def test_run_initial_synthesis_inserts_and_activates():
     print("[OK] _run_initial_synthesis happy path")
 
 
+def test_weight_bar_rendering():
+    """Tiny ASCII gauge for role_family weights."""
+    ns = _load_page()
+    bar = ns["_weight_bar"]
+    assert bar(0.0) == "░" * 10
+    assert bar(1.0) == "█" * 10
+    assert bar(0.5).count("█") == 5 and bar(0.5).count("░") == 5
+    # Robust to None / weird input.
+    assert bar(None).count("░") == 10  # type: ignore[arg-type]
+    assert bar(2.0).count("█") == 10  # clamped to 1.0
+    assert bar(-3).count("░") == 10  # clamped to 0.0
+    print("[OK] _weight_bar")
+
+
+def test_render_scoring_recap_runs_on_rich_synthesis():
+    """The recap card renders without raising on a populated synthesis."""
+    ns = _load_page()
+    syn = {
+        "summary_fr": "Profil pharma senior.",
+        "role_families": [
+            {"label": "CRA", "titles": ["CRA"], "weight": 1.0, "active": True},
+            {"label": "Clinical PM", "titles": ["CPM"], "weight": 0.7, "active": True},
+            {"label": "Reg Affairs", "titles": ["RA"], "weight": 0.5, "active": False},
+        ],
+        "seniority_band": {"label": "senior", "yoe_min": 7, "yoe_max": 12},
+        "geo": {
+            "primary": ["Geneva, Switzerland"],
+            "acceptable": ["Basel, Switzerland"],
+            "exclude": ["United States"],
+        },
+        "deal_breakers": ["sales", "intern"],
+        "dream_companies": ["Roche", "Novartis"],
+        "languages": ["FR-native", "EN-C1"],
+        "confidence": 0.8,
+        "open_questions": [],
+    }
+    ns["_render_scoring_recap"](syn)
+    print("[OK] _render_scoring_recap on rich synthesis")
+
+
+def test_render_scoring_recap_runs_on_empty_synthesis():
+    """Empty synthesis must not crash — every field falls back to caption."""
+    ns = _load_page()
+    ns["_render_scoring_recap"]({})  # totally empty
+    ns["_render_scoring_recap"]({
+        "role_families": [],
+        "geo": {"primary": [], "acceptable": [], "exclude": []},
+        "deal_breakers": [],
+        "dream_companies": [],
+    })
+    print("[OK] _render_scoring_recap robust to empty synthesis")
+
+
+def test_render_scoring_recap_handles_inactive_only():
+    """All families inactive → recap still runs, surfaces the count."""
+    ns = _load_page()
+    syn = {
+        "role_families": [
+            {"label": "Old", "titles": ["x"], "weight": 0.5, "active": False},
+            {"label": "Older", "titles": ["y"], "weight": 0.3, "active": False},
+        ],
+        "geo": {"primary": ["Paris"], "acceptable": [], "exclude": []},
+    }
+    ns["_render_scoring_recap"](syn)
+    print("[OK] _render_scoring_recap handles all-inactive families")
+
+
+def test_render_diagnostics_runs_on_rich_synthesis():
+    """The diagnostics expander renders without raising on a populated
+    synthesis: scraper preview + prompt preview both succeed."""
+    ns = _load_page()
+    syn = {
+        "summary_fr": "Profil structureur equity, 4 ans XP, Genève.",
+        "role_families": [
+            {
+                "label": "Equity Structurer",
+                "titles": ["Equity Structurer", "Investment Solutions"],
+                "weight": 1.0,
+                "active": True,
+                "source": {"type": "cv", "evidence": ""},
+            },
+            {
+                "label": "Cross-Asset Sales",
+                "titles": ["Cross-Asset Sales"],
+                "weight": 0.6,
+                "active": True,
+            },
+        ],
+        "seniority_band": {"label": "mid", "yoe_min": 3, "yoe_max": 7},
+        "geo": {
+            "primary": ["Geneva, Switzerland"],
+            "acceptable": ["Zurich, Switzerland"],
+            "exclude": [],
+        },
+        "deal_breakers": ["audit"],
+        "dream_companies": ["Pictet"],
+        "languages": ["FR-native"],
+        "confidence": 0.8,
+        "open_questions": [],
+    }
+    ns["_render_diagnostics"](syn, "CV excerpt for the prompt preview.")
+    print("[OK] _render_diagnostics on rich synthesis")
+
+
+def test_render_diagnostics_handles_empty_queries():
+    """No active families → scraper preview emits zero queries; prompt preview
+    still renders. The whole expander stays non-fatal."""
+    ns = _load_page()
+    syn = {
+        "summary_fr": "rien",
+        "role_families": [],  # nothing active → 0 queries
+        "geo": {"primary": [], "acceptable": [], "exclude": []},
+        "seniority_band": {"label": "junior", "yoe_min": 0, "yoe_max": 2},
+        "deal_breakers": [],
+        "dream_companies": [],
+        "languages": [],
+        "confidence": 0.4,
+        "open_questions": [],
+    }
+    ns["_render_diagnostics"](syn, "")
+    print("[OK] _render_diagnostics handles empty synthesis (0 queries)")
+
+
+def test_render_diagnostics_robust_to_empty_cv():
+    """`cv_text=""` must not raise: prompt preview falls back to empty stub."""
+    ns = _load_page()
+    syn = {
+        "role_families": [
+            {"label": "X", "titles": ["t"], "weight": 1.0, "active": True},
+        ],
+        "geo": {"primary": ["Paris"], "acceptable": [], "exclude": []},
+        "seniority_band": {"label": "mid", "yoe_min": 2, "yoe_max": 5},
+        "deal_breakers": [],
+        "dream_companies": [],
+        "languages": [],
+        "confidence": 0.7,
+        "open_questions": [],
+    }
+    ns["_render_diagnostics"](syn, "")
+    print("[OK] _render_diagnostics robust to empty CV text")
+
+
 def test_run_initial_synthesis_llm_failure_does_nothing():
     """If `synthesize_profile` raises, no draft is inserted / activated."""
     ns = _load_page(active=None, cv_text="cv", config={}, synth_fail=True)
@@ -386,7 +536,14 @@ def test_run_initial_synthesis_llm_failure_does_nothing():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     test_pure_helpers_load()
+    test_weight_bar_rendering()
     test_build_edited_synthesis_pure()
+    test_render_scoring_recap_runs_on_rich_synthesis()
+    test_render_scoring_recap_runs_on_empty_synthesis()
+    test_render_scoring_recap_handles_inactive_only()
+    test_render_diagnostics_runs_on_rich_synthesis()
+    test_render_diagnostics_handles_empty_queries()
+    test_render_diagnostics_robust_to_empty_cv()
     test_main_empty_state_no_cv()
     test_main_lazy_migration_path()
     test_main_with_active_synthesis()

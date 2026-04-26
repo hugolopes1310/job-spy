@@ -234,6 +234,70 @@ def _cover_letter_dialog(
 
 
 # ---------------------------------------------------------------------------
+# Score decomposition strip
+# ---------------------------------------------------------------------------
+def _score_chip(label: str, value: int | float | None) -> str:
+    """Render a tiny "label N/10" chip with a color tied to the value bucket.
+
+    Returns a self-contained HTML span. Designed to sit inline in a thin row.
+    Returns empty string if `value` is missing/invalid — callers can filter.
+    """
+    try:
+        if value is None:
+            return ""
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if v < 0:
+        return ""  # heuristic placeholder (-1 means "couldn't compute")
+    if v >= 8:
+        bg, fg = "#DCFCE7", "#15803D"  # green
+    elif v >= 5:
+        bg, fg = "#FEF3C7", "#B45309"  # amber
+    else:
+        bg, fg = "#FEE2E2", "#B91C1C"  # red
+    return (
+        f'<span style="display:inline-flex;align-items:center;gap:0.25rem;'
+        f'padding:0.2rem 0.55rem;border-radius:999px;background:{bg};color:{fg};'
+        f'font-size:0.78rem;font-weight:600;">'
+        f'<span style="opacity:0.8;font-weight:500;">{label}</span> '
+        f'<span style="font-variant-numeric:tabular-nums;">{int(round(v))}/10</span>'
+        f'</span>'
+    )
+
+
+def _render_score_decomposition(analysis: dict) -> None:
+    """Show match_role / match_geo / match_seniority as colored chips.
+
+    The synthesis-aware scorer (analyze_offer_with_synthesis) emits these three
+    fields; older matches scored via the legacy analyze_offer_for_user path may
+    or may not carry them. We render only the chips that are actually present
+    so legacy rows don't show empty placeholders.
+    """
+    role = analysis.get("match_role")
+    geo  = analysis.get("match_geo")
+    sen  = analysis.get("match_seniority")
+    chips = [
+        _score_chip("Rôle",      role),
+        _score_chip("Géo",       geo),
+        _score_chip("Séniorité", sen),
+    ]
+    chips = [c for c in chips if c]
+    if not chips:
+        return  # legacy match — keep the card clean
+    st.markdown(
+        '<div style="display:flex;gap:0.4rem;flex-wrap:wrap;align-items:center;'
+        'margin:0.1rem 0 0.7rem;">'
+        '<span style="font-size:0.72rem;font-weight:600;color:#94A3B8;'
+        "letter-spacing:0.06em;text-transform:uppercase;margin-right:0.2rem;\">"
+        "Décomposition</span>"
+        + "".join(chips)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Match card
 # ---------------------------------------------------------------------------
 def _render_match(
@@ -308,6 +372,11 @@ def _render_match(
                 f'</div>',
                 unsafe_allow_html=True,
             )
+
+        # Decomposition: shows what drove the score (rôle / géo / séniorité).
+        # Only renders if the analysis dict carries the sub-scores — legacy
+        # matches scored before PR3 stay clean.
+        _render_score_decomposition(analysis)
 
         if strengths or red_flags:
             c1, c2 = st.columns(2)

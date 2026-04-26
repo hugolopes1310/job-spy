@@ -63,6 +63,8 @@ from app.lib.profile_synthesizer import (  # noqa: E402
     ProfileSynthesisError,
     synthesize_profile,
 )
+from app.lib.query_builder import build_queries_from_synthesis  # noqa: E402
+from app.lib.scorer import build_system_prompt_from_synthesis  # noqa: E402
 from app.lib.storage import (  # noqa: E402
     load_cv_text,
     load_user_config,
@@ -94,6 +96,238 @@ def _section_header(title: str, caption: str = "") -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _weight_bar(weight: float, *, slots: int = 10) -> str:
+    """Tiny ASCII gauge for a 0-1 weight. Used in the scoring recap card.
+
+    Renders as `██████░░░░` so the user grasps the relative priority of each
+    role_family at a glance, without dragging in a chart lib.
+    """
+    try:
+        w = max(0.0, min(1.0, float(weight)))
+    except (TypeError, ValueError):
+        w = 0.0
+    filled = round(w * slots)
+    return "█" * filled + "░" * (slots - filled)
+
+
+def _render_scoring_recap(syn: dict[str, Any]) -> None:
+    """Read-only "how I'll score" panel.
+
+    Surfaces what the LLM understood from the user's CV/config AND the formula
+    that drives the per-offer score. Pure visualization — does not introduce
+    any st.session_state. Designed to sit between the summary card and the
+    editable cards: the user reads the recap, then scrolls down to adjust.
+    """
+    role_families = list(syn.get("role_families") or [])
+    families_active = sorted(
+        [f for f in role_families if isinstance(f, dict) and f.get("active", True)],
+        key=lambda f: float(f.get("weight") or 0.0),
+        reverse=True,
+    )
+    families_inactive = [
+        f for f in role_families
+        if isinstance(f, dict) and not f.get("active", True)
+    ]
+
+    geo = syn.get("geo") or {}
+    primary = [s for s in (geo.get("primary") or []) if s]
+    acceptable = [s for s in (geo.get("acceptable") or []) if s]
+    exclude = [s for s in (geo.get("exclude") or []) if s]
+
+    sb = syn.get("seniority_band") or {}
+    sb_label = (sb.get("label") or "?").strip() or "?"
+    yoe_min = sb.get("yoe_min")
+    yoe_max = sb.get("yoe_max")
+    sb_str = (
+        f"{sb_label} ({yoe_min}-{yoe_max} ans XP)"
+        if yoe_min is not None and yoe_max is not None
+        else sb_label
+    )
+
+    dream = [c for c in (syn.get("dream_companies") or []) if c]
+    breakers = [b for b in (syn.get("deal_breakers") or []) if b]
+    languages = [l for l in (syn.get("languages") or []) if l]
+
+    with st.container(border=True):
+        st.markdown(
+            '<div style="font-weight:600;margin-bottom:0.3rem;">'
+            "Comment Kairo va te scorer"
+            "</div>"
+            '<div style="color:#64748B;font-size:0.85rem;margin-bottom:0.8rem;">'
+            "Chaque offre reçoit un score 0-10 selon cette formule. "
+            "Édite les sections ci-dessous pour ajuster ce que l'IA optimise."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        # --- Formula ---------------------------------------------------------
+        st.markdown(
+            "**Formule**  \n"
+            "`score = 0.4 × match rôle + 0.3 × match géo "
+            "+ 0.2 × match séniorité + 0.1 × bonus dream-co`  \n"
+            "À ce score on applique :  \n"
+            "• un **plafond à 2** si le titre tombe sur un deal-breaker "
+            "structurant ou si l'offre est dans une géo exclue,  \n"
+            "• un **plancher à 7-8** si l'entreprise est dans tes dream "
+            "companies."
+        )
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+
+        # --- Two-column recap ------------------------------------------------
+        col_l, col_r = st.columns(2)
+
+        with col_l:
+            st.markdown("**Familles de rôles cibles** · _40 % du score_")
+            if not families_active:
+                st.caption("_Aucune famille active. Le scraper ne va rien ramener._")
+            else:
+                for f in families_active[:5]:
+                    label = (f.get("label") or "?").strip() or "?"
+                    w = float(f.get("weight") or 0.0)
+                    st.markdown(
+                        f"<div style='font-family:monospace;font-size:0.85rem;'>"
+                        f"<span style='color:#0F766E;'>{_weight_bar(w)}</span> "
+                        f"&nbsp;<b>{label}</b> "
+                        f"<span style='color:#64748B;'>· poids {w:.2f}</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                if len(families_active) > 5:
+                    st.caption(f"+ {len(families_active) - 5} autres familles actives")
+            if families_inactive:
+                st.caption(
+                    f"{len(families_inactive)} famille(s) désactivée(s) "
+                    "(ignorée(s) par le scraper et le scoring)."
+                )
+
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            st.markdown("**Séniorité visée** · _20 % du score_")
+            st.write(sb_str)
+
+        with col_r:
+            st.markdown("**Géographie** · _30 % du score_")
+            if primary:
+                st.markdown(
+                    f"<span style='color:#15803D;'>● Primaire (10/10)</span> "
+                    f"&nbsp;{', '.join(primary)}",
+                    unsafe_allow_html=True,
+                )
+            if acceptable:
+                st.markdown(
+                    f"<span style='color:#B45309;'>● Acceptable (≈7/10)</span> "
+                    f"&nbsp;{', '.join(acceptable)}",
+                    unsafe_allow_html=True,
+                )
+            if exclude:
+                st.markdown(
+                    f"<span style='color:#B91C1C;'>● Exclu (cap à 2)</span> "
+                    f"&nbsp;{', '.join(exclude)}",
+                    unsafe_allow_html=True,
+                )
+            if not (primary or acceptable or exclude):
+                st.caption("_Aucune géo configurée._")
+
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            st.markdown("**Dream companies** · _booste le score (+10 % et plancher)_")
+            if dream:
+                head = ", ".join(dream[:6])
+                tail = (
+                    f" <span style='color:#64748B;'>(+{len(dream) - 6} autres)</span>"
+                    if len(dream) > 6 else ""
+                )
+                st.markdown(head + tail, unsafe_allow_html=True)
+            else:
+                st.caption("_Aucune. Ajoute des entreprises ci-dessous pour les booster._")
+
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            st.markdown("**Deal-breakers** · _plafond à 2 si dans le titre_")
+            if breakers:
+                head = ", ".join(breakers[:8])
+                tail = (
+                    f" <span style='color:#64748B;'>(+{len(breakers) - 8} autres)</span>"
+                    if len(breakers) > 8 else ""
+                )
+                st.markdown(head + tail, unsafe_allow_html=True)
+            else:
+                st.caption("_Aucun. Toutes les offres seront éligibles au scoring complet._")
+
+        # --- Footer : languages + total search reach -------------------------
+        if languages:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            st.caption(f"**Langues** : {', '.join(languages)}")
+
+
+def _render_diagnostics(syn: dict[str, Any], cv_text: str) -> None:
+    """Opt-in expander showing what the scraper and the scorer will actually
+    do with this synthesis. Two sub-blocks:
+
+    1. **Scraper preview** — runs `build_queries_from_synthesis()` in dry-run
+       mode (no network), counts queries by family, multiplies by the
+       per-query results cap to give a rough "jobs scanned per run" estimate.
+    2. **Prompt preview** — renders the full system prompt that the LLM will
+       see when scoring an offer (`build_system_prompt_from_synthesis`).
+
+    Both are read-only. The expander is collapsed by default so the page
+    stays clean for users who don't care about the internals.
+    """
+    with st.expander("Diagnostics — qu'est-ce que je fais avec ta synthèse ?", expanded=False):
+        # --- 1. Scraper preview ---------------------------------------------
+        # Defensive: build_queries_from_synthesis is pure and never raises,
+        # but a corrupted synthesis could trip an attribute lookup. Guard so
+        # the diagnostics block never blocks the rest of the page.
+        try:
+            queries = build_queries_from_synthesis(syn)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Impossible de générer les queries : {type(e).__name__} — {e}")
+            queries = []
+
+        results_per_query = 25  # mirror RESULTS_PER_QUERY in app/scraper/run.py
+        total_jobs_estimate = len(queries) * results_per_query
+
+        st.markdown("**1. Ce que le scraper va chercher**")
+        if not queries:
+            st.caption(
+                "_Aucune query ne sera émise — vérifie qu'au moins une famille est "
+                "active et que `geo.primary` ou `geo.acceptable` n'est pas vide._"
+            )
+        else:
+            # Group queries by search_term (= title) for readability.
+            by_title: dict[str, list[str]] = {}
+            for q in queries:
+                t = q["search_term"]
+                by_title.setdefault(t, []).append(q.get("location") or "remote")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Queries émises", len(queries))
+            col2.metric("Titres distincts", len(by_title))
+            col3.metric("Jobs scannés / run (max)", f"~{total_jobs_estimate}")
+            with st.expander(f"Détail des {len(queries)} queries", expanded=False):
+                for title, locs in by_title.items():
+                    st.markdown(
+                        f"- **{title}** → "
+                        + ", ".join(f"`{l}`" for l in locs)
+                    )
+
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+
+        # --- 2. Prompt preview ----------------------------------------------
+        st.markdown("**2. Le prompt envoyé au LLM pour scorer chaque offre**")
+        st.caption(
+            "Ce texte est injecté en tant que `system message` à chaque appel "
+            "Groq/Gemini. Le `user message` ajoute juste les champs de l'offre "
+            "(titre, entreprise, lieu, description)."
+        )
+        try:
+            # Truncate the CV excerpt to keep the previewed prompt readable —
+            # the real scorer also caps it at 2500 chars, but for preview a
+            # short stub is enough to convey shape.
+            preview_cv = (cv_text or "")[:300]
+            prompt = build_system_prompt_from_synthesis(syn, preview_cv)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Impossible de rendre le prompt : {type(e).__name__} — {e}")
+            return
+        st.code(prompt, language="markdown")
 
 
 def _confidence_pill(value: float | None) -> str:
@@ -274,6 +508,19 @@ def _render_synthesis_view(user_id: str, row: dict[str, Any]) -> None:
             unsafe_allow_html=True,
         )
         st.write(syn.get("summary_fr") or "_Pas de synthèse rédigée._")
+
+    # --- Scoring recap : "Comment Kairo va te scorer" -----------------------
+    _render_scoring_recap(syn)
+
+    # --- Diagnostics : scraper preview + prompt preview ---------------------
+    # Cheap lookup. If the CV row is missing or the call blows up we still
+    # render the block (scraper preview doesn't need it; the prompt preview
+    # falls back to an empty CV excerpt).
+    try:
+        cv_text_for_diag = load_cv_text(user_id) or ""
+    except Exception:  # noqa: BLE001
+        cv_text_for_diag = ""
+    _render_diagnostics(syn, cv_text_for_diag)
 
     # --- Role families -------------------------------------------------------
     with st.container(border=True):
