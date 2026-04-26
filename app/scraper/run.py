@@ -27,8 +27,10 @@ Env vars (or .streamlit/secrets.toml):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 # Make `app` importable as a module when running as a script.
@@ -52,11 +54,38 @@ from app.lib.scorer import (  # noqa: E402
     llm_quota_state,
     make_parse_failed_analysis,
 )
+from app.lib.scraper_runs_store import (  # noqa: E402
+    finish_run,
+    start_run,
+)
 from app.lib.scrapers import scrape_via_jobspy  # noqa: E402
 from app.lib.storage import (  # noqa: E402
     list_active_user_configs,
     update_custom_source_status,
 )
+
+
+def _classify_run_status(stats: dict[str, int], *, top_level_error: bool) -> str:
+    """Map per-run counters to one of {'ok', 'partial', 'failed'}.
+
+    'failed'  : a top-level exception bubbled up (we caught it but the run
+                couldn't complete cleanly).
+    'partial' : the run completed BUT at least one query / user / score
+                operation errored. Worth a glance from the admin.
+    'ok'      : every checked counter is zero.
+    """
+    if top_level_error:
+        return "failed"
+    failure_keys = (
+        "failed_llm",
+        "failed_upsert",
+        "failed_insert",
+        "failed_queries",
+        "custom_sources_failed",
+    )
+    if any(int(stats.get(k, 0) or 0) > 0 for k in failure_keys):
+        return "partial"
+    return "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -379,23 +408,84 @@ def run_for_user(user_id: str, *, dry_run: bool = False) -> dict[str, int]:
     Designed to be called from the dashboard with `with st.spinner(): …`. The
     call is blocking (typical 30-90s for ~30 jobs), but it's the simplest path
     that still gives the user a visible "fresh batch arrived" outcome.
+
+    Phase 5 — emits a `scraper_runs` row (runner='manual') for the admin
+    telemetry dashboard. Telemetry never blocks the actual scrape : a failure
+    in start_run/finish_run only logs and we keep going.
     """
+    run_id = start_run(runner="manual", triggered_by_user_id=user_id)
+
     try:
         users = list_active_user_configs()
     except Exception as e:  # noqa: BLE001
+        finish_run(
+            run_id,
+            status="failed",
+            errors=[{
+                "stage": "list_users",
+                "user_id": user_id,
+                "error": f"{type(e).__name__}: {e}",
+            }],
+            llm_quota=llm_quota_state(),
+        )
         return {"_status": "error", "error": f"{type(e).__name__}: {e}"}
 
     target = next((u for u in users if u.get("user_id") == user_id), None)
     if target is None:
+        finish_run(
+            run_id,
+            status="failed",
+            errors=[{
+                "stage": "lookup_user",
+                "user_id": user_id,
+                "error": "user_not_found",
+            }],
+            llm_quota=llm_quota_state(),
+        )
         return {"_status": "user_not_found"}
 
     try:
         stats = _process_user(target, dry_run=dry_run)
     except Exception as e:  # noqa: BLE001
+        finish_run(
+            run_id,
+            status="failed",
+            errors=[{
+                "stage": "process_user",
+                "user_id": user_id,
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc()[:2000],
+            }],
+            llm_quota=llm_quota_state(),
+        )
         return {"_status": "error", "error": f"{type(e).__name__}: {e}"}
+
+    finish_run(
+        run_id,
+        status=_classify_run_status(stats, top_level_error=False),
+        totals={
+            **{k: v for k, v in stats.items() if isinstance(v, (int, float))},
+            "users_processed": 1,
+        },
+        errors=[],
+        llm_quota=llm_quota_state(),
+    )
 
     stats["_status"] = "ok"
     return stats
+
+
+def _gha_run_url() -> str | None:
+    """Build the GitHub Actions run URL when we're inside a workflow run.
+    Returns None when running locally / outside GHA. The result is stuffed in
+    `scraper_runs.notes` so admins can jump straight to the workflow logs.
+    """
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not (repo and run_id):
+        return None
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    return f"{server}/{repo}/actions/runs/{run_id}"
 
 
 def main() -> None:
@@ -409,40 +499,117 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    print("[run] fetching active users…")
-    users = list_active_user_configs()
-    if args.user:
-        users = [u for u in users if u["email"].lower() == args.user.strip().lower()]
-        if not users:
-            print(f"[run] no approved user with email {args.user!r}")
-            sys.exit(1)
-    print(f"[run] {len(users)} user(s) to process")
+    # Phase 5 telemetry — open a scraper_runs row before we do any work so a
+    # crash on the very first import / fetch still gets surfaced in the admin
+    # panel. `runner` is 'cron' when GHA exposes its env, else 'cli'.
+    is_gha = bool(os.environ.get("GITHUB_ACTIONS"))
+    run_id = start_run(
+        runner="cron" if is_gha else "cli",
+        notes=_gha_run_url(),
+    )
 
     totals = {
         "queries": 0, "scraped": 0, "new_jobs": 0, "scored": 0,
         "failed_llm": 0, "failed_upsert": 0, "failed_insert": 0,
         "failed_queries": 0, "custom_sources_ok": 0, "custom_sources_failed": 0,
+        "users_processed": 0,
     }
-    for user in users:
-        s = _process_user(user, dry_run=args.dry_run)
-        for k in totals:
-            totals[k] += s.get(k, 0)
+    errors_list: list[dict] = []
 
-    print("\n=== Run summary ===")
-    for k, v in totals.items():
-        print(f"  {k}: {v}")
+    try:
+        print("[run] fetching active users…")
+        users = list_active_user_configs()
+        if args.user:
+            users = [u for u in users if u["email"].lower() == args.user.strip().lower()]
+            if not users:
+                print(f"[run] no approved user with email {args.user!r}")
+                # Telemetry-wise this is a 'failed' run (the operator asked for
+                # a user that doesn't exist) — close the row before exiting.
+                finish_run(
+                    run_id,
+                    status="failed",
+                    errors=[{
+                        "stage": "user_filter",
+                        "error": f"no approved user with email {args.user!r}",
+                    }],
+                    totals=totals,
+                    llm_quota=llm_quota_state(),
+                )
+                sys.exit(1)
+        print(f"[run] {len(users)} user(s) to process")
 
-    quota = llm_quota_state()
-    if quota["groq_tpd"] or quota["gemini_quota"]:
-        print(
-            f"\n[run] LLM quota: groq_tpd={quota['groq_tpd']} "
-            f"gemini_quota={quota['gemini_quota']} "
-            f"all_exhausted={quota['all_exhausted']}"
+        for user in users:
+            try:
+                s = _process_user(user, dry_run=args.dry_run)
+            except Exception as e:  # noqa: BLE001
+                # Per-user crash : record + keep going. _process_user itself
+                # already absorbs query / scoring failures, so reaching here
+                # means something more fundamental (e.g. config is malformed).
+                err_msg = f"{type(e).__name__}: {e}"
+                print(f"[run]   user {user.get('email')} crashed: {err_msg}")
+                errors_list.append({
+                    "stage": "process_user",
+                    "user_id": user.get("user_id"),
+                    "email": user.get("email"),
+                    "error": err_msg,
+                    "traceback": traceback.format_exc()[:2000],
+                })
+                continue
+            for k in totals:
+                if k == "users_processed":
+                    continue
+                totals[k] += s.get(k, 0)
+            totals["users_processed"] += 1
+
+        print("\n=== Run summary ===")
+        for k, v in totals.items():
+            print(f"  {k}: {v}")
+
+        quota = llm_quota_state()
+        if quota["groq_tpd"] or quota["gemini_quota"]:
+            print(
+                f"\n[run] LLM quota: groq_tpd={quota['groq_tpd']} "
+                f"gemini_quota={quota['gemini_quota']} "
+                f"all_exhausted={quota['all_exhausted']}"
+            )
+
+        if args.cleanup and not args.dry_run:
+            deleted = cleanup_stale_jobs(days=60)
+            print(f"[run] cleanup: deleted {deleted} stale job(s)")
+
+        # Status is 'partial' if any per-user crash hit errors_list OR any of
+        # the failure_keys counters are non-zero (handled inside _classify_run_status).
+        status = _classify_run_status(totals, top_level_error=False)
+        if errors_list and status == "ok":
+            status = "partial"
+        finish_run(
+            run_id,
+            status=status,
+            totals=totals,
+            errors=errors_list,
+            llm_quota=quota,
         )
-
-    if args.cleanup and not args.dry_run:
-        deleted = cleanup_stale_jobs(days=60)
-        print(f"[run] cleanup: deleted {deleted} stale job(s)")
+    except SystemExit:
+        # Triggered above by the --user filter not matching ; the row was
+        # already closed there. Just re-raise so the exit code propagates.
+        raise
+    except Exception as e:  # noqa: BLE001
+        err_msg = f"{type(e).__name__}: {e}"
+        print(f"[run] FATAL: {err_msg}")
+        finish_run(
+            run_id,
+            status="failed",
+            totals=totals,
+            errors=errors_list + [{
+                "stage": "top_level",
+                "error": err_msg,
+                "traceback": traceback.format_exc()[:2000],
+            }],
+            llm_quota=llm_quota_state(),
+        )
+        # Re-raise so the GHA workflow shows red — the telemetry row is just
+        # for the admin panel ; CI signal still matters.
+        raise
 
 
 if __name__ == "__main__":
