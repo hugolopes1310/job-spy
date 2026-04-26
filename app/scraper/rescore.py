@@ -16,6 +16,14 @@ Examples:
     # Cap how many we touch per run (Groq quota safety)
     python -m app.scraper.rescore --user lopeshugo1310@gmail.com --limit 50
 
+    # Re-queue mode: only retry rows that failed parsing last time.
+    # Lighter touch: skips healthy rows entirely, ideal for nightly cron.
+    python -m app.scraper.rescore --user lopeshugo1310@gmail.com --only-failed
+
+    # Re-queue ALL approved users at once (skip --user). Used by the nightly
+    # GitHub Actions workflow.
+    python -m app.scraper.rescore --all-users --only-failed
+
 Env vars (or .streamlit/secrets.toml):
     SUPABASE_URL
     SUPABASE_SERVICE_KEY
@@ -93,47 +101,37 @@ def _fmt_score(v) -> str:
     return f"{v:>2}" if isinstance(v, int) else " -"
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Rescore existing matches with the current scorer prompt")
-    p.add_argument("--user", required=True, help="Email of the user whose matches to rescore")
-    p.add_argument("--dry-run", action="store_true", help="Compute new scores, print diff, don't write")
-    p.add_argument(
-        "--max-old-score",
-        type=int,
-        default=None,
-        help="Only rescore matches with old score <= this (e.g. 3 to focus on losers). "
-             "Matches with NULL score are always included.",
-    )
-    p.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Max number of matches to rescore this run (Groq quota safety).",
-    )
-    p.add_argument(
-        "--sleep",
-        type=float,
-        default=LLM_COOLDOWN_SEC,
-        help=f"Seconds to sleep between LLM calls (default {LLM_COOLDOWN_SEC})",
-    )
-    args = p.parse_args()
+def _is_failed_analysis(analysis: Any) -> bool:
+    """A match needs re-queueing if its analysis carries an _error marker
+    (parse_failed, llm_unavailable) OR was produced by the heuristic fallback.
 
-    print(f"[rescore] looking up user {args.user!r}…")
-    users = [u for u in list_active_user_configs()
-             if u["email"].lower() == args.user.strip().lower()]
-    if not users:
-        print(f"[rescore] no approved user with email {args.user!r}")
-        sys.exit(1)
-    user = users[0]
+    The heuristic is "good enough" but we'd rather have a real LLM score
+    once the quota refreshes — so we re-queue heuristic results too.
+    """
+    if not isinstance(analysis, dict):
+        return analysis is None  # NULL analysis → re-queue
+    if analysis.get("_error"):
+        return True
+    if analysis.get("_method") == "heuristic":
+        return True
+    return False
+
+
+def _process_one_user(args, user: dict) -> tuple[int, int]:
+    """Rescore eligible matches for a single user. Returns (rescored, failures)."""
     user_id = user["user_id"]
+    email = user.get("email") or "?"
     config = user.get("config") or {}
     cv_text = user.get("cv_text") or ""
-    print(f"[rescore] user_id={user_id}  config_keys={list(config.keys())}  cv_chars={len(cv_text)}")
+    print(f"\n[rescore] === user={email}  user_id={user_id}  cv_chars={len(cv_text)} ===")
 
     matches = _fetch_matches_for_user(user_id)
     print(f"[rescore] fetched {len(matches)} existing match(es)")
 
     def _eligible(m: dict) -> bool:
+        # --only-failed shortcut: skip everything that has a clean LLM analysis.
+        if args.only_failed and not _is_failed_analysis(m.get("analysis")):
+            return False
         if args.max_old_score is None:
             return True
         old = m.get("score")
@@ -143,18 +141,16 @@ def main() -> None:
     if args.limit is not None:
         targets = targets[: args.limit]
     print(f"[rescore] {len(targets)} match(es) in scope "
-          f"(max_old_score={args.max_old_score}, limit={args.limit})")
+          f"(only_failed={args.only_failed}, max_old_score={args.max_old_score}, "
+          f"limit={args.limit})")
     if not targets:
-        print("[rescore] nothing to do.")
-        return
+        print("[rescore] nothing to do for this user.")
+        return 0, 0
 
     svc = get_service_client()
-
-    # ------------------------------------------------------------------
-    # Process
-    # ------------------------------------------------------------------
     diffs: list[tuple[dict, int | None, int | None]] = []
     fail = 0
+
     for i, m in enumerate(targets, 1):
         job = m["job"]
         old_score = m.get("score")
@@ -196,8 +192,6 @@ def main() -> None:
                 svc.table("user_job_matches").update({
                     "score": new_score,
                     "analysis": analysis,
-                    # Don't touch status/scored_at/seen_at/is_favorite/notes — we're
-                    # only updating the scoring output, not re-treating the match as new.
                 }).eq("user_id", user_id).eq("job_id", m["job_id"]).execute()
             except Exception as e:  # noqa: BLE001
                 print(f"[rescore]   ⚠ upsert failed: {e}")
@@ -205,58 +199,75 @@ def main() -> None:
 
         time.sleep(args.sleep)
 
-    # ------------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------------
-    ups = [d for d in diffs
-           if isinstance(d[1], int) and isinstance(d[2], int) and d[2] > d[1]]
-    downs = [d for d in diffs
-             if isinstance(d[1], int) and isinstance(d[2], int) and d[2] < d[1]]
-    same = [d for d in diffs
-            if isinstance(d[1], int) and isinstance(d[2], int) and d[2] == d[1]]
+    return len(diffs), fail
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Rescore existing matches with the current scorer prompt")
+    grp = p.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--user", help="Email of the user whose matches to rescore")
+    grp.add_argument("--all-users", action="store_true",
+                     help="Rescore matches for every approved user (used by nightly cron)")
+    p.add_argument("--dry-run", action="store_true", help="Compute new scores, print diff, don't write")
+    p.add_argument(
+        "--max-old-score",
+        type=int,
+        default=None,
+        help="Only rescore matches with old score <= this (e.g. 3 to focus on losers). "
+             "Matches with NULL score are always included.",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max number of matches to rescore this run (Groq quota safety). "
+             "Applied PER USER when --all-users is set.",
+    )
+    p.add_argument(
+        "--only-failed",
+        action="store_true",
+        help="Only re-queue rows where the previous analysis failed (parse_failed, "
+             "llm_unavailable, or heuristic fallback). Cheap nightly retry mode.",
+    )
+    p.add_argument(
+        "--sleep",
+        type=float,
+        default=LLM_COOLDOWN_SEC,
+        help=f"Seconds to sleep between LLM calls (default {LLM_COOLDOWN_SEC})",
+    )
+    args = p.parse_args()
+
+    all_users = list_active_user_configs()
+    if args.all_users:
+        targets_users = all_users
+        print(f"[rescore] --all-users: {len(targets_users)} approved user(s) in scope")
+    else:
+        targets_users = [u for u in all_users
+                         if u["email"].lower() == args.user.strip().lower()]
+        if not targets_users:
+            print(f"[rescore] no approved user with email {args.user!r}")
+            sys.exit(1)
+
+    total_rescored = 0
+    total_fail = 0
+    for u in targets_users:
+        try:
+            r, f = _process_one_user(args, u)
+        except Exception as e:  # noqa: BLE001
+            print(f"[rescore] user {u.get('email')!r} crashed: {e} — skipping")
+            total_fail += 1
+            continue
+        total_rescored += r
+        total_fail += f
 
     print()
-    print("=== Summary ===")
-    print(f"  rescored: {len(diffs)}   failures: {fail}")
-    print(f"  ↑ boosted: {len(ups)}    ↓ lowered: {len(downs)}    = unchanged: {len(same)}")
-
-    def _bucket(v):
-        if not isinstance(v, int):
-            return "N/A"
-        if v >= 8:
-            return ">=8"
-        if v >= 6:
-            return "6-7"
-        if v >= 4:
-            return "4-5"
-        return "<4"
-
-    buckets_before: dict[str, int] = {}
-    buckets_after: dict[str, int] = {}
-    for _, o, n in diffs:
-        buckets_before[_bucket(o)] = buckets_before.get(_bucket(o), 0) + 1
-        buckets_after[_bucket(n)] = buckets_after.get(_bucket(n), 0) + 1
-    print()
-    print("  distribution:")
-    print("    bucket  before  after")
-    for b in (">=8", "6-7", "4-5", "<4", "N/A"):
-        bf = buckets_before.get(b, 0)
-        af = buckets_after.get(b, 0)
-        if bf or af:
-            print(f"    {b:>6}  {bf:>6}  {af:>5}")
-
-    if ups:
-        print()
-        print("  TOP BOOSTS (old → new):")
-        ups_sorted = sorted(ups, key=lambda d: (d[2] - d[1]), reverse=True)[:10]
-        for m, o, n in ups_sorted:
-            j = m["job"]
-            print(f"    {_fmt_score(o)} → {_fmt_score(n)}  "
-                  f"{_short(j.get('title'), 46):48s} @ {_short(j.get('company'), 22)}")
+    print("=== TOTAL ===")
+    print(f"  users processed: {len(targets_users)}")
+    print(f"  rescored:        {total_rescored}")
+    print(f"  failures:        {total_fail}")
 
     if args.dry_run:
-        print()
-        print("(dry-run — no rows written. Re-run without --dry-run to persist.)")
+        print("\n(dry-run — no rows written. Re-run without --dry-run to persist.)")
 
 
 if __name__ == "__main__":

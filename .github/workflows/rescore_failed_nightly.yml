@@ -1,0 +1,72 @@
+name: Rescore failed (nightly)
+
+# Re-queues every match whose previous analysis failed (parse_failed,
+# llm_unavailable, or fell back to the local heuristic). Runs every night
+# at 03:00 UTC — picks up after the daily scrape (which runs earlier) and
+# benefits from a fresh Groq TPD window (which resets at midnight UTC).
+#
+# Manual trigger via "Run workflow" is also enabled for ad-hoc reruns.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"  # 03:00 UTC = 04:00 Paris (CET) / 05:00 (CEST)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run (compute new scores but don't persist)"
+        required: false
+        default: "false"
+        type: choice
+        options: [ "false", "true" ]
+      limit:
+        description: "Max rows to retry per user (Groq quota safety)"
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Avoid two rescore runs hammering Groq at the same time.
+  group: rescore-nightly
+  cancel-in-progress: false
+
+jobs:
+  rescore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Rescore failed matches for all approved users
+        env:
+          PYTHONPATH: .
+          LOG_LEVEL: info
+          # Secrets — set in GitHub repo → Settings → Secrets and variables → Actions
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -e
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+          LIMIT="${{ github.event.inputs.limit || '30' }}"
+          python -m app.scraper.rescore \
+            --all-users \
+            --only-failed \
+            --limit "$LIMIT" \
+            $DRY_RUN_FLAG

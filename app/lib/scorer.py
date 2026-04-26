@@ -236,7 +236,17 @@ def _summarize_profile(config: dict[str, Any], cv_text: str) -> str:
 
 
 def build_system_prompt(config: dict[str, Any], cv_text: str) -> str:
-    """System prompt for `analyze_offer_for_user`, personalized to this user."""
+    """System prompt for `analyze_offer_for_user`, personalized to this user.
+
+    v2 changes vs v1:
+      - Explicit step-by-step process (forces structured reasoning).
+      - Numerical formula instead of holistic "rubric feel".
+      - `_reasoning` JSON-CoT field (3 sentences) → stripped post-parse,
+        but forces the model to think before scoring.
+      - 4 adversarial examples (orphan deal-breakers, dream-co + adjacent role,
+        full-remote w/o geo, seniority above target).
+      - Self-check rules at the end.
+    """
     profile_block = _summarize_profile(config, cv_text)
     raw_brief = (config.get("raw_brief") or "").strip()
     brief_block = f"\n--- Brief libre du candidat ---\n{raw_brief[:1500]}\n" if raw_brief else ""
@@ -248,10 +258,11 @@ def build_system_prompt(config: dict[str, Any], cv_text: str) -> str:
 Tu dois produire une analyse structurée EN FRANÇAIS, au format JSON strict :
 
 {{
-  "score": <int 0-10>,                   // score global de fit
-  "reason": "<1 phrase FR synthèse>",
-  "match_role": <int 0-10>,              // match titre/fonction avec target.roles
-  "match_geo": <int 0-10>,               // 10 si dans constraints.locations, 0 si deal-breaker géo
+  "_reasoning": "<3 phrases — étapes 1→6 du processus ci-dessous, pour cadrer ton raisonnement>",
+  "score": <int 0-10>,                   // score global de fit (issu de la FORMULE)
+  "reason": "<1 phrase FR synthèse, lisible côté UI>",
+  "match_role": <int 0-10>,              // match titre/fonction avec target.roles (sémantique)
+  "match_geo": <int 0-10>,               // 10 si dans constraints.locations, 0 si totalement off
   "match_seniority": <int 0-10>,         // match avec target.seniority
   "red_flags": ["<3 max, très courts>"],
   "strengths": ["<3 max — atouts à mettre en avant en entretien>"],
@@ -261,42 +272,139 @@ Tu dois produire une analyse structurée EN FRANÇAIS, au format JSON strict :
   "apply_hint": "<string courte — ex: 'Easy Apply', 'Via site carrière'>"
 }}
 
-BARÈME DU SCORE GLOBAL :
-- 9-10 : match parfait — rôle cible (même SYNONYME/ROLE VOISIN) + bonne géo + séniorité OK, aucun deal-breaker structurant
-- 7-8 : très pertinent — ex: entreprise cible + rôle adjacent, OU rôle cible exact avec 1 axe légèrement faible
-- 5-6 : intéressant mais 1 axe clairement faible (géo 2h de train, séniorité off d'un cran, rôle voisin)
-- 3-4 : lien ténu — rôle décalé ET pas dans "Companies rêvées", OU 2 axes faibles
-- 0-2 : deal-breaker STRUCTURANT présent (le rôle EST un stage/alternance/middle-office/etc.), ou géo/rôle totalement off
+═══════════════════════════════════════════════════════════════════
+PROCESSUS À SUIVRE (raisonne dans `_reasoning` avant de scorer)
+═══════════════════════════════════════════════════════════════════
 
-RÈGLES DE MATCHING — TRÈS IMPORTANT :
+ÉTAPE 1 — Identifier le titre exact du poste (champ Titre, ou 1ère phrase
+          de la description si Titre est ambigu/générique).
 
-1. **MATCH SÉMANTIQUE, PAS LITTÉRAL**. "Customised Solutions Specialist" = match avec "Investment Solutions Structurer". "Structured Products Sales" = "Derivatives Sales" = "Solutions Sales". "Equity Derivatives" couvre aussi "Equity Structuring", "Index / Rates / Hybrids Structurer". Les MUST-have sont des FAMILLES de compétences — pas des chaînes exactes. Un match sémantique compte comme un match.
+ÉTAPE 2 — match_role (0-10) : à quel point le titre correspond
+          SÉMANTIQUEMENT à un des "Rôles visés" ?
+          - 10 = match exact ou synonyme strict (ex: "Equity Structuring
+            Analyst" pour un cible "Structurer")
+          - 7-9 = rôle voisin / famille de compétences identique
+            (ex: "Customised Solutions Specialist" ≈ "Investment Solutions
+            Structurer")
+          - 4-6 = rôle adjacent en finance mais axe différent (Quant Risk
+            pour cible Structuring)
+          - 0-3 = métier différent (Sales pur, Compliance, Audit, IT…)
 
-2. **BOOST TARGET COMPANIES**. Si l'entreprise de l'offre figure dans "Companies rêvées" (même fuzzy : "Pictet Group" = "Pictet", "Pictet AM" = "Pictet"), le score MINIMUM est 7 à moins que le rôle soit un deal-breaker structurant (stage/intern/middle-office/audit primaire). Si en plus le rôle matche sémantiquement → 9-10.
+ÉTAPE 3 — match_geo (0-10) : la localisation tombe-t-elle dans
+          constraints.locations (avec rayon) ?
+          - 10 = même ville ou voisine évidente (Genève=Geneva=Nyon ;
+            Zurich=Zürich=Zug à 30km près)
+          - 6-9 = même pays, à <2h de train
+          - 3-5 = même région large (Europe DACH si target=Suisse)
+          - 0-2 = totalement off (US/Asie si target=EU)
+          - REMOTE : si remote=any/yes ET poste 100% remote → 10
+            indépendamment de la ville annoncée.
 
-3. **DEAL-BREAKERS ≠ mots-clés orphelins**. Un deal-breaker ne déclenche un cap à 2 QUE si c'est le cœur du poste :
-   - "audit" cap le score SEULEMENT si c'est un poste d'audit (titre = "Auditor", "Audit Manager"). Si "audit" apparaît juste dans "travailler avec les équipes audit" → on ignore.
-   - "compliance" cap SEULEMENT si titre = "Compliance Officer" ou similaire. Mentionné dans une description de poste de structuration → on ignore.
-   - "stage", "alternance", "intern", "junior (stage)" → cap si c'est un contrat stage/alternance (check type de contrat et titre).
-   - "MD", "Senior Director", "Head of" → cap si titre EST "MD / Director / Head" (pas si "MD" apparaît comme abréviation ailleurs).
-   - "middle-office", "back-office", "settlement", "NAV", "custodian", "trade support" → cap SEULEMENT si c'est le métier du poste (titre ou 1ère phrase de la description).
-   - Dans le doute (mention ponctuelle dans du texte long, sans lien au poste) → tu N'appliques PAS le cap.
+ÉTAPE 4 — match_seniority (0-10) :
+          - 10 = pile dans target.seniority
+          - 7-9 = un cran au-dessus ou en dessous (junior si target=mid)
+          - 4-6 = deux crans d'écart
+          - 0-3 = MD/VP si target=junior, ou intern si target=senior
 
-4. **MUST-HAVE = signal positif, pas obligation**. Un rôle qui match sémantiquement un des rôles cibles, dans une entreprise cible, SANS qu'aucun must-have littéral apparaisse → toujours scorable à 7-9 si l'alignement global est clair. Les must-have boostent si présents (sémantiquement), ils ne capent PAS l'absence.
+ÉTAPE 5 — DEAL-BREAKER STRUCTURANT ? (vital — anti-spillover)
+          Un mot deal-breaker n'a d'effet QUE s'il décrit le CŒUR du poste.
+          → Cherche dans : Titre + 1ère phrase de la description.
+          → Si le mot apparaît juste en passant ("travailler avec les équipes
+             audit", "support compliance", "interface back-office") =
+             ORPHELIN, on IGNORE.
 
-5. **GEO** : les villes dans constraints.locations (et leur rayon) matchent leurs voisines évidentes (Genève = Geneva = Nyon = Lausanne à 30km près ; Zurich = Zürich = Zug à 30km près).
+          Cas où on cap le score à 0-2 :
+            * Titre = "Auditor" / "Audit Manager" → audit
+            * Titre = "Compliance Officer" / "AML Analyst" → compliance
+            * Type contrat = stage/alternance/internship → cap (sauf si
+              target.seniority inclut "stage")
+            * Titre = "Middle Office" / "Back Office" / "Trade Support" /
+              "Settlement" → cap
+            * Titre ou famille = Software Engineer / IT / DevOps si target
+              est finance → cap
+            * Tout métier de target.deal_breakers explicitement nommé.
 
-EXEMPLES :
-- "Customised Solutions Specialist @ Pictet Group, Geneva" avec Hugo qui cible "Investment Solutions Structurer" et "Pictet" comme dream company → score **9** (match sémantique rôle + dream company + géo parfaite).
-- "Equity Structuring Analyst @ Vontobel, Zurich" → **9-10** (rôle sémantiquement identique + dream company + géo).
-- "Risk Quant Analyst @ Trafigura, Geneva" sans "Trafigura" dans les cibles → **5-6** (rôle voisin quant en finance, bonne géo, mais pas dans les dream companies et pas structuring).
-- "Alternance Assistant Commercial @ Framatome" → **0-1** (contrat stage = deal-breaker structurant).
-- "Software Engineer COBOL @ VESTRALA, Lyon" → **0** (software engineer = deal-breaker structurant).
+ÉTAPE 6 — BONUS dream company :
+          - 10 si l'entreprise de l'offre figure dans target.companies
+            (matching FUZZY : "Pictet Group" = "Pictet AM" = "Pictet")
+          - 0 sinon.
 
-AUTRES :
-- Ne jamais inventer — si une info manque (salaire, contact...), mets null.
-- Red flags et strengths : 3 max chacun, phrases très courtes.
-- Tu réponds UNIQUEMENT avec le JSON. Pas de markdown, pas de commentaire.
+═══════════════════════════════════════════════════════════════════
+FORMULE DU SCORE GLOBAL (applique-la, ne devine pas)
+═══════════════════════════════════════════════════════════════════
+
+base = 0.40 × match_role
+     + 0.30 × match_geo
+     + 0.20 × match_seniority
+     + 0.10 × bonus_dream_co
+
+Puis :
+  - Si DEAL-BREAKER STRUCTURANT (étape 5) : score = min(2, round(base))
+  - Sinon, si bonus_dream_co = 10 ET match_role >= 7 : score = max(8, round(base))
+  - Sinon, si bonus_dream_co = 10 ET match_role >= 4 : score = max(7, round(base))
+  - Sinon : score = round(base), clampé à [0, 10]
+
+═══════════════════════════════════════════════════════════════════
+EXEMPLES (4 cas adversariaux)
+═══════════════════════════════════════════════════════════════════
+
+EX1 — DEAL-BREAKER ORPHELIN (anti-spill majeur)
+"Equity Derivatives Structurer @ Pictet, Geneva. Description : ... vous
+travaillerez en interaction étroite avec les équipes Audit et Compliance ..."
+→ "Audit"/"Compliance" sont ORPHELINS (mention en passant, pas le métier).
+   match_role=10, match_geo=10, match_seniority=8, dream_co=10.
+   base = 4 + 3 + 1.6 + 1 = 9.6 → 10. Pas de cap. SCORE = **10**.
+
+EX2 — DREAM CO + RÔLE ADJACENT
+"Risk Manager Equity Derivatives @ Pictet, Geneva" (target = Structurer)
+→ match_role=6 (adjacent : risk vs structuring, mais même desk),
+   match_geo=10, match_seniority=8, dream_co=10.
+   base = 2.4 + 3 + 1.6 + 1 = 8.0. Bonus dream_co + match_role>=4 force
+   floor 7. Pas de cap. SCORE = **8**.
+
+EX3 — FULL REMOTE SANS MATCH GÉO
+"Quant Developer (100% remote) @ Trafigura, London" (target = Geneva,
+remote=any). Match_role=8, match_seniority=9, dream_co=0.
+match_geo=10 grâce au remote (override location). base = 3.2 + 3 + 1.8 + 0
+= 8.0 → SCORE = **8**.
+
+EX4 — SÉNIORITÉ TROP HAUTE
+"Managing Director Equity Solutions @ JP Morgan, Geneva" (target=junior/mid)
+→ match_role=9, match_geo=10, match_seniority=2 (MD = 4 crans au-dessus),
+   dream_co=0. base = 3.6 + 3 + 0.4 + 0 = 7.0 → SCORE = **7**. Pas de
+   cap : MD/Director ne déclenche un cap QUE si target ne couvre pas du tout
+   ce niveau (ici junior/mid → cap n'est pas appliqué, mais base reflète déjà
+   l'écart via match_seniority bas).
+
+═══════════════════════════════════════════════════════════════════
+VÉRIFICATION FINALE (avant de retourner le JSON)
+═══════════════════════════════════════════════════════════════════
+
+Avant de produire ta réponse, fais ces 3 contrôles mentaux :
+
+V1 — Le score colle-t-il à la formule ? Recompute :
+     round(0.4·match_role + 0.3·match_geo + 0.2·match_seniority + 0.1·dream_co)
+     Si écart > 1 sans deal-breaker, recale.
+
+V2 — As-tu confondu un mot deal-breaker ORPHELIN avec un deal-breaker
+     STRUCTURANT ? Si le titre n'est PAS un titre d'audit/compliance/back-office
+     et que tu as quand même cap à 2 → REMONTE le score à la base.
+
+V3 — Si l'entreprise est dans Companies rêvées ET match_role >= 4, le score
+     est >= 7. Si tu as mis < 7, recale.
+
+═══════════════════════════════════════════════════════════════════
+RÈGLES OPÉRATIONNELLES
+═══════════════════════════════════════════════════════════════════
+
+- Match sémantique, jamais littéral. "Customised Solutions Specialist" =
+  match avec "Investment Solutions Structurer".
+- MUST-have = signal positif (boost). L'absence ne CAP pas. Un rôle qui
+  matche sémantiquement sans aucun must-have explicite reste scorable >= 7.
+- Ne jamais inventer salary/contact/deadline → null si absent.
+- Red flags & strengths : 3 max chacun, phrases courtes.
+- Tu réponds UNIQUEMENT avec le JSON (commence par '{{', finis par '}}').
+  Pas de markdown, pas de préambule, pas de commentaire après.
 """
 
 
@@ -323,6 +431,9 @@ def _call_groq(system: str, user_msg: str, *, max_tokens: int = 700) -> dict | N
         "temperature": 0.15,
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
+        # Determinism: same offer + same prompt → same score across runs.
+        # Groq supports `seed` (OpenAI-compatible). Gemini has its own seed below.
+        "seed": 42,
     }
     data = json.dumps(payload).encode("utf-8")
     headers = {
@@ -391,6 +502,8 @@ def _call_gemini(system: str, user_msg: str, *, max_tokens: int = 700) -> dict |
             "temperature": 0.15,
             "maxOutputTokens": max_tokens,
             "responseMimeType": "application/json",
+            # Determinism: same input → same score.
+            "seed": 42,
         },
     }
     data = json.dumps(payload).encode("utf-8")
@@ -472,17 +585,169 @@ def _call_llm(system: str, user_msg: str, *, max_tokens: int = 700) -> dict | No
 
 
 # ---------------------------------------------------------------------------
+# Heuristic fallback — used when EVERY LLM provider has failed.
+# ---------------------------------------------------------------------------
+# Cheap, deterministic, fully local. Better than None, worse than the LLM.
+# The dashboard surfaces `_method = "heuristic"` so the user knows it's
+# best-effort.
+_DEAL_BREAKER_TITLE_TOKENS = (
+    # Title-level deal-breakers (English + French). Substring match against
+    # the job title only — never the description (avoids the orphan trap).
+    "audit", "auditor", "auditeur",
+    "compliance", "aml", "kyc",
+    "back office", "back-office", "middle office", "middle-office",
+    "settlement", "trade support", "post-trade", "operations analyst",
+    "stagiaire", "stage", "alternance", "intern ", "internship", "apprenti",
+    "software engineer", "devops", "front-end", "backend", "full-stack",
+)
+
+
+def _normalize(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _heuristic_score(
+    user_config: dict[str, Any],
+    cv_text: str,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Local rules-based fallback when all LLM providers are down.
+
+    Returns a stable dict with the same shape as the LLM output, plus
+    `_method = "heuristic"` so the UI / scraper can flag it as best-effort.
+
+    Algorithm (intentionally simple, predictable, fast):
+      - role: % of target.roles tokens present in title (max 10).
+      - geo:  10 if any target city substring in location, else 5 if same
+              country can be inferred, else 2.
+      - seniority: 10 if target seniority token is in title, else 5.
+      - dream company bonus: +3 floor if company in target.companies.
+      - deal-breaker check on the title.
+    """
+    title = _normalize(job.get("title"))
+    company = _normalize(job.get("company"))
+    location = _normalize(job.get("location"))
+
+    target = user_config.get("target") or {}
+    constraints = user_config.get("constraints") or {}
+    target_roles = [_normalize(r) for r in (target.get("roles") or []) if r]
+    target_companies = [_normalize(c) for c in (target.get("companies") or []) if c]
+    seniority_targets = [_normalize(s) for s in (target.get("seniority") or []) if s]
+    target_cities = [_normalize(loc.get("city"))
+                     for loc in (constraints.get("locations") or [])
+                     if loc.get("city")]
+
+    # match_role : naive token overlap on the title (capped at 10).
+    role_hits = sum(1 for r in target_roles if r and r in title)
+    if role_hits >= 2:
+        match_role = 10
+    elif role_hits == 1:
+        match_role = 7
+    elif any(tok in title for tok in ("structurer", "structuring", "solutions",
+                                     "derivatives", "quant")):
+        match_role = 5
+    else:
+        match_role = 2
+
+    # match_geo : substring of any target city in the location string.
+    if target_cities and any(city and city in location for city in target_cities):
+        match_geo = 10
+    elif location and any(city and any(part in location for part in city.split())
+                          for city in target_cities if city):
+        match_geo = 6
+    else:
+        match_geo = 3
+
+    # match_seniority : token overlap on the title.
+    if not seniority_targets:
+        match_seniority = 5  # no info → neutral
+    elif any(s and s in title for s in seniority_targets):
+        match_seniority = 10
+    else:
+        match_seniority = 4
+
+    dream_bonus = 10 if any(c and c in company for c in target_companies) else 0
+
+    # Deal-breaker check on the TITLE only (avoids orphan-keyword trap).
+    deal_breaker = any(tok in title for tok in _DEAL_BREAKER_TITLE_TOKENS)
+
+    base = (
+        0.40 * match_role
+        + 0.30 * match_geo
+        + 0.20 * match_seniority
+        + 0.10 * dream_bonus
+    )
+    if deal_breaker:
+        score = min(2, round(base))
+    elif dream_bonus == 10 and match_role >= 7:
+        score = max(8, round(base))
+    elif dream_bonus == 10 and match_role >= 4:
+        score = max(7, round(base))
+    else:
+        score = round(base)
+    score = max(0, min(10, score))
+
+    log("scorer.heuristic_fallback", level="warn",
+        title=title[:60], company=company[:30], score=score)
+
+    return {
+        "score": score,
+        "reason": "Score calculé localement (tous les LLMs indisponibles).",
+        "match_role": match_role,
+        "match_geo": match_geo,
+        "match_seniority": match_seniority,
+        "red_flags": ["Analyse heuristique (LLMs indisponibles)"],
+        "strengths": [],
+        "salary": None,
+        "contact": None,
+        "deadline": None,
+        "apply_hint": None,
+        "_method": "heuristic",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+# Suffix appended to user_msg on the self-correction retry. Strong, explicit:
+# we want the model to commit to STRICT JSON only, no fences, no preamble.
+_SELF_CORRECTION_SUFFIX = (
+    "\n\n---\nRAPPEL CRITIQUE : ta réponse précédente n'a pas pu être parsée "
+    "comme du JSON valide. Cette fois, tu DOIS répondre UNIQUEMENT avec un "
+    "objet JSON conforme au schéma — commence par '{' et termine par '}'. "
+    "Pas de markdown (```), pas de préambule, pas de commentaire après. "
+    "Si tu hésites sur un champ, mets null plutôt que d'inventer une syntaxe."
+)
+
+
+def _strip_internal_keys(result: dict[str, Any]) -> dict[str, Any]:
+    """Drop transient fields the LLM emits for reasoning purposes.
+
+    `_reasoning` is part of the JSON schema (forces chain-of-thought) but it
+    has no value to the UI — strip before persistence to keep the analysis
+    payload compact. We KEEP `_method` and `_error` (set by us, not the LLM).
+    """
+    result.pop("_reasoning", None)
+    return result
+
+
 def analyze_offer_for_user(
     user_config: dict[str, Any],
     cv_text: str,
     job: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Return a structured analysis dict, or None on failure.
+    """Return a structured analysis dict, or None on total failure.
 
-    `job` is a row from `public.jobs`, or any dict with keys
-    title / company / location / description.
+    Reliability layers (in order):
+      1. LLM call: Groq → Gemini fallback chain (existing).
+      2. Self-correction: if parse failed, retry once with a stronger
+         "JSON strict only" instruction.
+      3. Heuristic fallback: when both LLMs returned None, compute a local
+         best-effort score from target keywords + geo + seniority. The result
+         carries `_method = "heuristic"` so the UI can flag it.
+
+    Returns None ONLY if the heuristic also short-circuits (shouldn't happen
+    in practice — kept as a safety valve).
     """
     system = build_system_prompt(user_config, cv_text)
     user_msg = (
@@ -491,9 +756,26 @@ def analyze_offer_for_user(
         f"Lieu : {job.get('location') or ''}\n"
         f"Description :\n{(job.get('description') or '')[:2500]}"
     )
+
+    # Layer 1 — normal LLM call.
     result = _call_llm(system, user_msg)
+
+    # Layer 2 — self-correction. Only retry if it's worth it: skip when both
+    # providers are quota-exhausted (no LLM left to ask).
+    if result is None and not (_GROQ_TPD_EXHAUSTED and _GEMINI_QUOTA_EXHAUSTED):
+        log("scorer.self_correction_retry", level="info")
+        result = _call_llm(system, user_msg + _SELF_CORRECTION_SUFFIX)
+
+    # Layer 3 — heuristic fallback when all LLMs are exhausted or unparseable.
     if result is None:
-        return None
+        log("scorer.fallback_to_heuristic", level="warn",
+            title=(job.get("title") or "")[:60])
+        result = _heuristic_score(user_config, cv_text, job)
+        # Heuristic returns a fully-formed dict; skip normalization below.
+        return result
+
+    # Strip CoT reasoning before persistence (keeps the analysis payload tight).
+    result = _strip_internal_keys(result)
 
     # Normalize keys so the dashboard can rely on them.
     result.setdefault("score", 0)

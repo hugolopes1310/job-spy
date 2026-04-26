@@ -157,6 +157,158 @@ def test_sub_scores_normalized(s):
 
 
 # ---------------------------------------------------------------------------
+# v2 — Reliability: self-correction, _reasoning strip, heuristic fallback.
+# ---------------------------------------------------------------------------
+def test_reasoning_field_stripped(s):
+    """The LLM emits `_reasoning` for chain-of-thought; we drop it post-parse."""
+    s._call_llm = lambda *a, **k: {  # type: ignore[attr-defined]
+        "_reasoning": "etape 1: ... etape 2: ...",
+        "score": 8,
+        "reason": "match",
+    }
+    out = s.analyze_offer_for_user({}, "", {"title": "x"})
+    assert out is not None
+    assert "_reasoning" not in out, "internal CoT field must not leak to UI"
+    assert out["score"] == 8
+    print("[OK] _reasoning stripped from final analysis")
+
+
+def test_self_correction_retry_on_parse_fail(s):
+    """When the first call returns None and providers aren't exhausted, we
+    retry once with the correction suffix appended."""
+    calls: list[str] = []
+
+    def fake_call(system, user_msg, *, max_tokens=700):
+        calls.append(user_msg)
+        # First call returns None (parse failure). Second returns valid.
+        if len(calls) == 1:
+            return None
+        return {"score": 6, "reason": "ok-after-retry"}
+
+    s._call_llm = fake_call  # type: ignore[attr-defined]
+    s._GROQ_TPD_EXHAUSTED = False  # type: ignore[attr-defined]
+    s._GEMINI_QUOTA_EXHAUSTED = False  # type: ignore[attr-defined]
+
+    out = s.analyze_offer_for_user({}, "", {"title": "x", "description": "d"})
+    assert out is not None
+    assert out["score"] == 6
+    assert len(calls) == 2, f"expected 2 calls (original + correction), got {len(calls)}"
+    assert "RAPPEL CRITIQUE" in calls[1], "correction suffix must include the strong hint"
+    assert "RAPPEL CRITIQUE" not in calls[0], "first call must NOT carry the suffix"
+    print("[OK] self-correction loop retries once with strong suffix")
+
+
+def test_self_correction_skipped_when_all_quotas_dead(s):
+    """No point retrying when both providers are quota-exhausted — skip the
+    self-correction call and go straight to the heuristic."""
+    calls: list[str] = []
+
+    def fake_call(system, user_msg, *, max_tokens=700):
+        calls.append(user_msg)
+        return None  # everything fails
+
+    s._call_llm = fake_call  # type: ignore[attr-defined]
+    s._GROQ_TPD_EXHAUSTED = True  # type: ignore[attr-defined]
+    s._GEMINI_QUOTA_EXHAUSTED = True  # type: ignore[attr-defined]
+
+    out = s.analyze_offer_for_user(
+        {"target": {"roles": ["structurer"]}},
+        "",
+        {"title": "Equity Structurer", "company": "X", "location": "Geneva"},
+    )
+    assert out is not None, "heuristic must give us *something*"
+    assert out.get("_method") == "heuristic"
+    assert len(calls) == 1, f"only the original call (no retry), got {len(calls)}"
+
+    # reset
+    s._GROQ_TPD_EXHAUSTED = False  # type: ignore[attr-defined]
+    s._GEMINI_QUOTA_EXHAUSTED = False  # type: ignore[attr-defined]
+    print("[OK] self-correction skipped when all quotas dead")
+
+
+def test_heuristic_fallback_dream_co_match(s):
+    """All LLMs fail → heuristic must still produce a score, with dream-co
+    boost when the company is in target.companies."""
+    s._call_llm = lambda *a, **k: None  # type: ignore[attr-defined]
+    s._GROQ_TPD_EXHAUSTED = True  # type: ignore[attr-defined]
+    s._GEMINI_QUOTA_EXHAUSTED = True  # type: ignore[attr-defined]
+
+    cfg = {
+        "target": {
+            "roles": ["structurer", "structuring"],
+            "companies": ["pictet"],
+            "seniority": ["analyst"],
+        },
+        "constraints": {"locations": [{"city": "Geneva"}]},
+    }
+    out = s.analyze_offer_for_user(cfg, "", {
+        "title": "Equity Structurer Analyst",
+        "company": "Pictet Group",
+        "location": "Geneva, Switzerland",
+        "description": "great role",
+    })
+    assert out is not None
+    assert out.get("_method") == "heuristic"
+    assert out["score"] >= 7, f"dream-co + role match should floor at 7, got {out['score']}"
+    assert out["match_role"] >= 7
+    assert out["match_geo"] == 10
+
+    # reset
+    s._GROQ_TPD_EXHAUSTED = False  # type: ignore[attr-defined]
+    s._GEMINI_QUOTA_EXHAUSTED = False  # type: ignore[attr-defined]
+    print("[OK] heuristic floors score at 7 for dream-co + role match")
+
+
+def test_heuristic_fallback_deal_breaker_caps(s):
+    """Heuristic must cap at 2 when title contains a structural deal-breaker."""
+    s._call_llm = lambda *a, **k: None  # type: ignore[attr-defined]
+    s._GROQ_TPD_EXHAUSTED = True  # type: ignore[attr-defined]
+    s._GEMINI_QUOTA_EXHAUSTED = True  # type: ignore[attr-defined]
+
+    cfg = {
+        "target": {"roles": ["structurer"], "companies": ["pictet"]},
+        "constraints": {"locations": [{"city": "Geneva"}]},
+    }
+    # Even at Pictet in Geneva, an "Internship" title must cap the score.
+    out = s.analyze_offer_for_user(cfg, "", {
+        "title": "Equity Structuring Internship",
+        "company": "Pictet",
+        "location": "Geneva",
+        "description": "x",
+    })
+    assert out is not None
+    assert out["score"] <= 2, f"deal-breaker title must cap, got {out['score']}"
+
+    s._GROQ_TPD_EXHAUSTED = False  # type: ignore[attr-defined]
+    s._GEMINI_QUOTA_EXHAUSTED = False  # type: ignore[attr-defined]
+    print("[OK] heuristic caps at 2 on title-level deal-breaker")
+
+
+def test_is_failed_analysis_helper():
+    """Helper used by rescore --only-failed to decide which rows to re-queue.
+
+    The helper lives in `app.scraper.rescore`, but importing that module
+    cascades into `app.lib.storage` → `app.lib.auth` → `streamlit`, which
+    is not always present in dev sandboxes. Skip cleanly if the import
+    chain isn't available — CI (GitHub Actions) installs streamlit so it
+    always runs there.
+    """
+    try:
+        from app.scraper.rescore import _is_failed_analysis  # noqa: E402
+    except ModuleNotFoundError as e:
+        print(f"[SKIP] _is_failed_analysis import unavailable ({e.name}) — CI will exercise it")
+        return
+
+    assert _is_failed_analysis(None) is True, "NULL analysis must be re-queued"
+    assert _is_failed_analysis({"score": 8, "reason": "ok"}) is False
+    assert _is_failed_analysis({"_error": "parse_failed"}) is True
+    assert _is_failed_analysis({"_error": "llm_unavailable"}) is True
+    assert _is_failed_analysis({"_method": "heuristic", "score": 7}) is True
+    assert _is_failed_analysis({"score": 5}) is False  # clean LLM result
+    print("[OK] _is_failed_analysis correctly identifies re-queue targets")
+
+
+# ---------------------------------------------------------------------------
 # Driver.
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -174,4 +326,11 @@ if __name__ == "__main__":
     test_quota_state_groq_exhausted(s)
     test_score_clamping(s)
     test_sub_scores_normalized(s)
+    # v2 reliability
+    test_reasoning_field_stripped(s)
+    test_self_correction_retry_on_parse_fail(s)
+    test_self_correction_skipped_when_all_quotas_dead(s)
+    test_heuristic_fallback_dream_co_match(s)
+    test_heuristic_fallback_deal_breaker_caps(s)
+    test_is_failed_analysis_helper()
     print("\nAll scorer parsing tests passed.")
