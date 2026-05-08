@@ -79,8 +79,7 @@ Ajoute :
 ### 6) Lancer le dashboard
 
 ```bash
-python app.py
-# → http://127.0.0.1:5000
+streamlit run app/streamlit_app.py
 ```
 
 Tu y verras les offres triées par score, avec des boutons pour passer une offre en `applied`, `interview`, `ignored`.
