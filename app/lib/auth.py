@@ -11,9 +11,27 @@ Flow:
 
 Session keys used:
     sb_access_token, sb_refresh_token, sb_user_id, sb_user_email, sb_expires_at
-"""
-from __future__ import annotations
 
+FIX-14 — cookie persistence removed
+-----------------------------------
+We previously persisted Supabase's `refresh_token` in a browser cookie via
+`extra-streamlit-components.CookieManager` so a hard refresh (F5) wouldn't
+log the user out. The iframe-backed component caused three different bugs
+in two weeks (FIX-11 / FIX-12 / FIX-13) — most notably, the warmup loop in
+`get_current_user()` was firing `st.rerun()` on every rerender, which
+swallowed every widget event on the login screen (forms AND plain buttons),
+leaving users with a "spinner forever, no error" experience that we could
+not reproduce locally.
+
+Pragmatic call: rip out the cookies. F5 now logs the user out — annoying
+but predictable. Auth state lives entirely in `st.session_state`.
+
+NOTE: this module deliberately does NOT use `from __future__ import annotations`.
+Python 3.11's @dataclass decorator has a bug (fixed in 3.12) where it crashes
+with `'NoneType' object has no attribute '__dict__'` if the dataclass is
+defined while the surrounding module is still being registered in sys.modules
+under Streamlit's scriptrunner. Eager evaluation of annotations sidesteps it.
+"""
 import re
 import time
 from dataclasses import dataclass
@@ -22,11 +40,6 @@ from typing import Any
 import streamlit as st
 
 from app.lib.klog import log
-from app.lib.session_cookies import (
-    clear_refresh_token,
-    load_refresh_token,
-    save_refresh_token,
-)
 from app.lib.supabase_client import get_anon_client, get_service_client
 
 
@@ -37,28 +50,6 @@ SESSION_EXPIRED_KEY = "auth_session_expired_msg"
 
 # Minimum enforced length for user-chosen passwords (matches Supabase default).
 MIN_PASSWORD_LENGTH = 8
-
-# --- Cookie warm-up retry budget -----------------------------------------
-# `extra-streamlit-components.CookieManager` runs in an iframe. On the first
-# script run after a hard refresh / cold start, the iframe hasn't posted its
-# cookies back yet, so `_read_cookies()` returns `{}` indistinguishable from
-# "no cookie set at all". To survive that race we allow `get_current_user()`
-# to issue a bounded number of `st.rerun()`s, sleeping briefly between each,
-# before giving up and returning None. Once auth succeeds (or definitively
-# fails) the counter is reset.
-_COOKIE_WARMUP_KEY = "_kairo_auth_cookie_warmup_attempts"
-# Budget tuned for Streamlit Cloud cold starts. The cookie iframe routinely
-# takes ~1s to mount + post on a fresh container; 5 × 0.4s = 2s gives us a
-# comfortable margin without delaying the login screen for users who really
-# aren't authenticated.
-_COOKIE_WARMUP_MAX = 5          # total reruns allowed
-_COOKIE_WARMUP_SLEEP_S = 0.4    # gap between reruns to let the iframe load
-
-# After save_refresh_token() at login time, give the iframe a moment to
-# flush the cookie write back to the browser before we rerun the page.
-# Without this, the user logs in → page reruns immediately → the SET command
-# never made it out of the iframe → next visit has no cookie.
-_COOKIE_FLUSH_SLEEP_S = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +89,28 @@ def send_otp(email: str) -> tuple[bool, str]:
         return True, f"Code envoyé à {email}. Vérifie ta boîte mail (et les spams)."
     except Exception as e:  # noqa: BLE001
         msg = str(e)
+        # FIX-11: log every send_otp failure so a paused/unreachable backend
+        # surfaces in the cloud logs instead of just a generic "Erreur envoi
+        # code" message disappearing in a rerun.
+        log("auth.send_otp.error", level="warn",
+            err_type=type(e).__name__, err=msg[:200])
         # Supabase rate-limits OTP sends (default: 60s between requests per email).
         # Parse the remaining cooldown to show a friendly message.
         m = re.search(r"after\s+(\d+)\s+seconds?", msg, flags=re.IGNORECASE)
         if m:
             secs = int(m.group(1))
             return False, f"Un code a déjà été envoyé récemment. Réessaie dans {secs} s."
+        # Network / backend-down heuristic → clearer banner.
+        low = msg.lower()
+        if any(k in low for k in (
+            "connection", "timeout", "timed out", "name resolution",
+            "max retries", "unreachable", "503", "502", "504",
+        )):
+            return False, (
+                "Le service d'authentification ne répond pas. "
+                "Réessaie dans quelques minutes — si le problème persiste, "
+                "préviens l'équipe."
+            )
         return False, f"Erreur envoi code : {msg}"
 
 
@@ -136,12 +143,6 @@ def verify_otp(email: str, code: str) -> tuple[bool, str]:
     st.session_state["sb_user_id"]       = user.id
     st.session_state["sb_user_email"]    = user.email
     st.session_state["sb_expires_at"]    = session.expires_at
-    # Persist the refresh token in a browser cookie so a page refresh (F5)
-    # doesn't log the user out.
-    save_refresh_token(session.refresh_token)
-    # Pause so the cookie iframe actually flushes the SET to the browser
-    # before our caller fires st.rerun() / st.switch_page().
-    wait_for_cookie_flush()
     return True, "Connecté."
 
 
@@ -151,15 +152,9 @@ def verify_otp(email: str, code: str) -> tuple[bool, str]:
 def get_current_user() -> CurrentUser | None:
     """Return the authenticated user, refreshing the token if needed.
 
-    If `st.session_state` is empty (e.g. right after a hard refresh), we try
-    to rehydrate from the refresh_token stored in a browser cookie.
-
-    The cookie iframe (`extra-streamlit-components`) is not always ready on
-    the first script run — its `get_all()` returns `{}` indistinguishable
-    from "user has no cookie at all". To avoid bouncing logged-in users to
-    the login screen on a hard refresh we allow up to `_COOKIE_WARMUP_MAX`
-    reruns, sleeping briefly each time, before concluding the user really
-    is not authenticated.
+    Auth state lives entirely in `st.session_state`. A hard refresh (F5)
+    therefore creates a new session and logs the user out — that is the
+    deliberate FIX-14 trade-off (see module docstring).
 
     If the token has expired AND the refresh fails, we set a one-shot
     session flag so the login screen can show "ta session a expiré" instead
@@ -167,26 +162,7 @@ def get_current_user() -> CurrentUser | None:
     """
     token = st.session_state.get("sb_access_token")
     if not token:
-        # Try to restore from the persistent cookie set on login.
-        if _try_refresh_from_cookie():
-            token = st.session_state.get("sb_access_token")
-        if not token:
-            # Cookie was empty. Distinguish "iframe not yet loaded" (retry
-            # once) from "really not logged in" (fall through to None).
-            if _should_retry_cookie_warmup():
-                _bump_cookie_warmup_attempts()
-                # Sleep gives the component iframe a moment to post its
-                # cookies back to the server before the next script run.
-                time.sleep(_COOKIE_WARMUP_SLEEP_S)
-                st.rerun()
-                # `st.rerun()` raises a RerunException — code below never
-                # executes during the retry path. The `return None` is
-                # only reached if rerun is monkey-patched (e.g. tests).
-                return None
-            # Budget exhausted → really not logged in. Reset for the next
-            # script-level navigation so we don't carry the count forever.
-            _reset_cookie_warmup_attempts()
-            return None
+        return None
 
     expires_at = _coerce_epoch(st.session_state.get("sb_expires_at"))
     # Refresh if the token expires in <60s.
@@ -206,29 +182,7 @@ def get_current_user() -> CurrentUser | None:
     if not (user_id and email and token):
         return None
 
-    # Auth confirmed — clear the warm-up counter so a future hard refresh
-    # gets the full retry budget again.
-    _reset_cookie_warmup_attempts()
     return CurrentUser(user_id=user_id, email=email, access_token=token)
-
-
-# ---------------------------------------------------------------------------
-# Cookie warm-up helpers (private)
-# ---------------------------------------------------------------------------
-def _should_retry_cookie_warmup() -> bool:
-    """True iff we still have retries left before declaring the user logged out."""
-    attempts = int(st.session_state.get(_COOKIE_WARMUP_KEY, 0) or 0)
-    return attempts < _COOKIE_WARMUP_MAX
-
-
-def _bump_cookie_warmup_attempts() -> None:
-    st.session_state[_COOKIE_WARMUP_KEY] = (
-        int(st.session_state.get(_COOKIE_WARMUP_KEY, 0) or 0) + 1
-    )
-
-
-def _reset_cookie_warmup_attempts() -> None:
-    st.session_state.pop(_COOKIE_WARMUP_KEY, None)
 
 
 def _coerce_epoch(value: Any) -> int:
@@ -255,21 +209,6 @@ def _coerce_epoch(value: Any) -> int:
         return 0
 
 
-def wait_for_cookie_flush() -> None:
-    """Block briefly so the cookie iframe can flush a SET back to the browser.
-
-    Called right after `save_refresh_token()` at login time, before the caller
-    fires its `st.rerun()` / `st.switch_page()`. Without this pause the rerun
-    can land before the iframe has written the cookie, leaving the user with
-    no persistent session — they appear logged in for the current tab but get
-    bounced on the next visit.
-    """
-    try:
-        time.sleep(_COOKIE_FLUSH_SLEEP_S)
-    except Exception:  # noqa: BLE001
-        pass
-
-
 def consume_session_expired_message() -> str | None:
     """Pop the one-shot "session expired" message, if any.
 
@@ -280,16 +219,13 @@ def consume_session_expired_message() -> str | None:
 
 
 def _apply_session(sess: Any, user: Any | None = None) -> None:
-    """Copy a Supabase Session (+ optional User) into st.session_state and
-    refresh the persistent cookie."""
+    """Copy a Supabase Session (+ optional User) into st.session_state."""
     st.session_state["sb_access_token"]  = sess.access_token
     st.session_state["sb_refresh_token"] = sess.refresh_token
     st.session_state["sb_expires_at"]    = sess.expires_at
     if user is not None:
         st.session_state["sb_user_id"]    = user.id
         st.session_state["sb_user_email"] = user.email
-    # Cookie refresh — supabase rotates the refresh_token on every call.
-    save_refresh_token(sess.refresh_token)
 
 
 def _try_refresh() -> bool:
@@ -308,31 +244,6 @@ def _try_refresh() -> bool:
         return False
 
 
-def _try_refresh_from_cookie() -> bool:
-    """Rehydrate the session from the refresh_token saved in a browser cookie.
-
-    Returns True on success — session_state is then fully populated and the
-    caller can treat the user as logged in.
-    """
-    rt = load_refresh_token()
-    if not rt:
-        return False
-    try:
-        client = get_anon_client()
-        result = client.auth.refresh_session(rt)
-    except Exception:  # noqa: BLE001
-        # Cookie is stale / revoked — wipe it so we stop trying on every load.
-        clear_refresh_token()
-        return False
-    sess = getattr(result, "session", None)
-    user = getattr(result, "user", None)
-    if not sess or not user:
-        clear_refresh_token()
-        return False
-    _apply_session(sess, user)
-    return True
-
-
 def logout() -> None:
     for k in (
         "sb_access_token",
@@ -346,8 +257,6 @@ def logout() -> None:
     for k in list(st.session_state.keys()):
         if k.startswith("ob_"):
             st.session_state.pop(k, None)
-    # Wipe the persistent cookie so the next page load doesn't auto-rehydrate.
-    clear_refresh_token()
     try:
         get_anon_client().auth.sign_out()
     except Exception:  # noqa: BLE001
@@ -363,10 +272,20 @@ def email_has_password(email: str) -> bool:
 
     Returns False for unknown emails and on any error — the UI will then
     fall back to the OTP flow which also creates the user if absent.
+
+    FIX-11: previously this swallowed exceptions silently, so when Supabase
+    was unreachable (paused free-tier project, network blip, expired keys)
+    the login screen would just spin forever as send_otp ALSO timed out,
+    with no signal in the server logs. We now log the exception so the next
+    backend outage is visible in `[WARN] event=auth.email_has_password.error`
+    and the caller can surface a clearer "service unavailable" banner.
     """
     email = (email or "").strip().lower()
     if "@" not in email:
         return False
+    # FIX-13: log entry so we can confirm the call is reached even when
+    # everything works (FIX-11 only logged the error path).
+    log("auth.email_has_password.start", level="info", email=email)
     try:
         svc = get_service_client()
         res = (
@@ -377,8 +296,13 @@ def email_has_password(email: str) -> bool:
             .execute()
         )
         data = res.data or []
-        return bool(data and data[0].get("has_password"))
-    except Exception:  # noqa: BLE001
+        has_pwd = bool(data and data[0].get("has_password"))
+        log("auth.email_has_password.done", level="info",
+            email=email, has_password=has_pwd, found=bool(data))
+        return has_pwd
+    except Exception as e:  # noqa: BLE001
+        log("auth.email_has_password.error", level="warn",
+            err_type=type(e).__name__, err=str(e)[:200])
         return False
 
 
@@ -413,18 +337,40 @@ def signin_with_password(email: str, password: str) -> tuple[bool, str]:
     if not password:
         return False, "Mot de passe requis."
 
+    # FIX-13: log entry BEFORE the Supabase call so we can confirm the form
+    # submission actually reached the auth code. If this event never appears
+    # in the cloud logs after a click, the hang is upstream (cookie warmup
+    # loop, form-submit event lost, or websocket dropped).
+    log("auth.signin.start", level="info", email=email)
     try:
         client = get_anon_client()
         result = client.auth.sign_in_with_password(
             {"email": email, "password": password}
         )
-    except Exception:  # noqa: BLE001
-        # Supabase returns 400 for wrong creds — don't leak which part failed.
+    except Exception as e:  # noqa: BLE001
+        # Supabase returns 400 for wrong creds — don't leak which part failed
+        # to the UI, but DO log it (FIX-11) so a paused/unreachable backend
+        # is visible in server logs instead of looking like silent rejection.
+        msg = str(e)
+        log("auth.signin.error", level="warn",
+            err_type=type(e).__name__, err=msg[:200])
+        # Heuristic: connection / network / DNS errors → backend down, not creds.
+        low = msg.lower()
+        if any(k in low for k in (
+            "connection", "timeout", "timed out", "name resolution",
+            "max retries", "unreachable", "503", "502", "504",
+        )):
+            return False, (
+                "Le service d'authentification ne répond pas. "
+                "Réessaie dans quelques minutes — si le problème persiste, "
+                "préviens l'équipe."
+            )
         return False, "Email ou mot de passe incorrect."
 
     session = getattr(result, "session", None)
     user = getattr(result, "user", None)
     if not session or not user:
+        log("auth.signin.empty_response", level="warn", email=email)
         return False, "Email ou mot de passe incorrect."
 
     st.session_state["sb_access_token"]  = session.access_token
@@ -432,8 +378,7 @@ def signin_with_password(email: str, password: str) -> tuple[bool, str]:
     st.session_state["sb_user_id"]       = user.id
     st.session_state["sb_user_email"]    = user.email
     st.session_state["sb_expires_at"]    = session.expires_at
-    save_refresh_token(session.refresh_token)
-    wait_for_cookie_flush()
+    log("auth.signin.success", level="info", user_id=user.id, email=email)
     return True, "Connecté."
 
 
